@@ -17,7 +17,7 @@ const { toCsv, toXlsxBuffer } = require('../src/exportData');
 const { GameStore, getRemoteKvConfig } = require('../src/store');
 const { createApp } = require('../src/gameServer');
 
-function invokeApp(app, method, reqPath, bodyObj = null) {
+function invokeApp(app, method, reqPath, bodyObj = null, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const rawBody = bodyObj ? JSON.stringify(bodyObj) : '';
     const req = Readable.from(rawBody ? [Buffer.from(rawBody, 'utf8')] : []);
@@ -26,6 +26,7 @@ function invokeApp(app, method, reqPath, bodyObj = null) {
     req.headers = {
       host: 'localhost:3000',
       'content-type': 'application/json',
+      ...extraHeaders,
     };
 
     const chunks = [];
@@ -165,7 +166,11 @@ test('Full HTTP API workflow: tickets -> session -> secret code submit -> CSV/Ex
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-test-'));
   const dbPath = path.join(tmpDir, 'db.json');
   const store = new GameStore(dbPath);
-  const app = createApp({ store });
+  const rawApp = createApp({ store, adminPassword: 'test-admin-pass' });
+  const app = (req, res) => {
+    req.headers = { 'x-admin-password': 'test-admin-pass', ...(req.headers || {}) };
+    return rawApp(req, res);
+  };
 
   try {
     // 1. Generate 3 tickets (10 numbers each)
@@ -424,21 +429,31 @@ test('Full HTTP API workflow: tickets -> session -> secret code submit -> CSV/Ex
   }
 });
 
-test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.body', async () => {
+test('Vercel serverless handler (api/index.js) serves GET / and enforces admin auth', async () => {
   const prevVercel = process.env.VERCEL;
+  const prevAdminPw = process.env.ADMIN_PASSWORD;
   process.env.VERCEL = '1';
+  process.env.ADMIN_PASSWORD = 'vercel-admin-secret';
   try {
     const handler = require('../api/index');
     const getResp = await invokeApp(handler, 'GET', '/');
     assert.equal(getResp.status, 200);
     assert.ok(getResp.text.includes('Office Number Game'));
 
+    // Unauthenticated callers must get 401 on admin APIs and never see secret codes
+    const unauthState = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/state');
+    assert.equal(unauthState.status, 401);
+    const unauthTickets = await invokeApp(handler, 'GET', '/api/tickets');
+    assert.equal(unauthTickets.status, 401);
+
     // Verify Vercel rewrite preserving path via __route query parameter
     const rewrittenHealth = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/health');
     assert.equal(rewrittenHealth.status, 200);
     assert.equal(JSON.parse(rewrittenHealth.text).ok, true);
 
-    const stateResp = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/state');
+    const stateResp = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/state', null, {
+      'x-admin-password': 'vercel-admin-secret',
+    });
     assert.equal(stateResp.status, 200);
     const stateBody = JSON.parse(stateResp.text);
     assert.equal(stateBody.ok, true);
@@ -453,6 +468,7 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
       host: 'number-game-nine-phi.vercel.app',
       'x-forwarded-proto': 'https,http',
       'content-type': 'application/json',
+      'x-admin-password': 'vercel-admin-secret',
     };
     req.body = { name: 'Vercel Test Round' };
 
@@ -473,10 +489,14 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
     assert.ok(parsed.session.playUrl.startsWith('https://number-game-nine-phi.vercel.app/play/'));
 
     // Clean up test session
-    await invokeApp(handler, 'POST', '/api/reset');
+    await invokeApp(handler, 'POST', '/api/reset', null, {
+      'x-admin-password': 'vercel-admin-secret',
+    });
   } finally {
     if (prevVercel === undefined) delete process.env.VERCEL;
     else process.env.VERCEL = prevVercel;
+    if (prevAdminPw === undefined) delete process.env.ADMIN_PASSWORD;
+    else process.env.ADMIN_PASSWORD = prevAdminPw;
   }
 });
 
@@ -499,6 +519,13 @@ test('Remote KV/Redis pipeline shares sessions and concurrent submissions across
       for (let i = 2; i < cmd.length; i += 2) {
         map.set(cmd[i], cmd[i + 1]);
       }
+      return { result: 1 };
+    }
+    if (op === 'HSETNX') {
+      if (!hashes.has(key)) hashes.set(key, new Map());
+      const map = hashes.get(key);
+      if (map.has(cmd[2])) return { result: 0 };
+      map.set(cmd[2], cmd[3]);
       return { result: 1 };
     }
     if (op === 'HDEL') {
@@ -551,8 +578,19 @@ test('Remote KV/Redis pipeline shares sessions and concurrent submissions across
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-kv-2-'));
   try {
     const remoteKv = { url: 'https://kv.example.test', token: 'tok', key: 'test_game_state' };
-    const app1 = createApp({ store: new GameStore(path.join(dir1, 'db.json'), { remoteKv }) });
-    const app2 = createApp({ store: new GameStore(path.join(dir2, 'db.json'), { remoteKv }) });
+    const kvPass = 'kv-admin-pass';
+    const rawApp1 = createApp({
+      store: new GameStore(path.join(dir1, 'db.json'), { remoteKv }),
+      adminPassword: kvPass,
+    });
+    const app1 = (req, res) => {
+      req.headers = { 'x-admin-password': kvPass, ...(req.headers || {}) };
+      return rawApp1(req, res);
+    };
+    const app2 = createApp({
+      store: new GameStore(path.join(dir2, 'db.json'), { remoteKv }),
+      adminPassword: kvPass,
+    });
 
     const tickets = await invokeApp(app1, 'POST', '/api/tickets/generate', {
       count: 2,

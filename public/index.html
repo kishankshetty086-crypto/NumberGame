@@ -8,6 +8,26 @@
 </head>
 <body>
   <div class="container">
+    <div id="admin-auth-gate" style="display:none; max-width:440px; margin:60px auto;">
+      <div class="card">
+        <div style="font-size:11px; font-weight:800; letter-spacing:0.1em; color:#a5b4fc;">OFFICE NUMBER GAME</div>
+        <h2 id="auth-title" style="margin:6px 0 8px;">Admin Login</h2>
+        <p id="auth-subtitle" style="margin:0 0 14px; color:var(--muted); font-size:13px;">
+          Enter the admin password to manage tickets, sessions, secret codes, and exports.
+        </p>
+        <div id="auth-storage-warning"></div>
+        <div id="auth-error"></div>
+        <form id="admin-auth-form">
+          <div class="field">
+            <label for="admin-password-input">Admin Password</label>
+            <input type="password" id="admin-password-input" autocomplete="current-password" minlength="4" maxlength="128" required />
+          </div>
+          <button type="submit" class="btn btn-primary" id="auth-submit-btn" style="width:100%;">Unlock Admin Dashboard</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="admin-app-shell" style="display:none;">
     <header class="topbar">
       <div class="brand">
         <h1>Office Number Game — Admin Control</h1>
@@ -18,6 +38,7 @@
         <span class="pill" id="pill-sessions">Active Sessions: 0</span>
         <span class="pill ok" id="pill-submissions">Stored Submissions: 0</span>
         <button type="button" class="btn btn-danger btn-sm" id="btn-clear-cache-top">Clear Cache / Start Fresh</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-admin-logout">Logout</button>
       </div>
     </header>
 
@@ -107,14 +128,14 @@
           <form id="create-session-form">
             <div class="field">
               <label for="session-name">Session / Round Name</label>
-              <input type="text" id="session-name" placeholder="e.g. Round 1 - Morning Session" required />
+              <input type="text" id="session-name" maxlength="100" placeholder="e.g. Round 1 - Morning Session" required />
             </div>
             <div class="alert alert-info" style="font-size:12.5px;">
               <strong>Active Game Checks:</strong>
               <ul style="margin:6px 0 0 18px; padding:0;">
                 <li>Once a player uses a number in a round, it is locked and cannot be reused in later rounds.</li>
-                <li>One submission per ticket per session.</li>
-                <li>Player form blocks browser DevTools / debugging shortcuts.</li>
+                <li>One submission per ticket per session (enforced atomically).</li>
+                <li>Secret code verified server-side per ticket; paste works freely in inputs.</li>
               </ul>
             </div>
             <button type="submit" class="btn btn-primary" id="create-session-btn" style="width:100%">
@@ -316,6 +337,7 @@
         </div>
       </div>
     </section>
+    </div>
   </div>
 
   <script src="/admin.js"></script>

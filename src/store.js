@@ -41,6 +41,7 @@ function createDefaultState() {
     tickets: [],
     sessions: [],
     submissions: [],
+    auth: null,
   };
 }
 
@@ -126,6 +127,7 @@ class GameStore {
     return {
       legacy: base,
       seq: `${base}:seq`,
+      auth: `${base}:auth`,
       tickets: `${base}:tickets`,
       sessions: `${base}:sessions`,
       submissions: `${base}:submissions`,
@@ -176,6 +178,7 @@ class GameStore {
       ['HGETALL', keys.sessions],
       ['HGETALL', keys.submissions],
       ['GET', keys.legacy],
+      ['GET', keys.auth],
     ]);
 
     const seqVal = results[0]?.result;
@@ -189,12 +192,21 @@ class GameStore {
       (a, b) => new Date(a.submittedAt || 0).getTime() - new Date(b.submittedAt || 0).getTime()
     );
     const legacyRaw = results[4]?.result;
+    let auth = null;
+    if (typeof results[5]?.result === 'string' && results[5].result.trim()) {
+      try {
+        auth = JSON.parse(results[5].result);
+      } catch {
+        auth = null;
+      }
+    }
 
     const hasHashData =
-      seqVal !== null && seqVal !== undefined ||
+      (seqVal !== null && seqVal !== undefined) ||
       tickets.length > 0 ||
       sessions.length > 0 ||
-      submissions.length > 0;
+      submissions.length > 0 ||
+      Boolean(auth);
 
     if (hasHashData) {
       this.state = {
@@ -202,6 +214,7 @@ class GameStore {
         tickets,
         sessions,
         submissions,
+        auth,
       };
     } else if (typeof legacyRaw === 'string' && legacyRaw.trim()) {
       const parsed = JSON.parse(legacyRaw);
@@ -213,6 +226,18 @@ class GameStore {
     this._pendingKvCommands = [];
     this._persist(this.state);
     this.exportFiles = this._writeExports();
+  }
+
+  getAuth() {
+    return this.state.auth || null;
+  }
+
+  setAuth(authObj) {
+    this.state.auth = authObj;
+    const keys = this._kvKeys();
+    this._queueKv(['SET', keys.auth, JSON.stringify(authObj)]);
+    this.save();
+    return this.state.auth;
   }
 
   async flushRemote() {
@@ -345,14 +370,46 @@ class GameStore {
   }
 
   deleteTicket(ticketId) {
-    const before = this.state.tickets.length;
-    this.state.tickets = this.state.tickets.filter((t) => t.ticketId !== ticketId);
-    if (this.state.tickets.length !== before) {
-      this._queueKv(['HDEL', this._kvKeys().tickets, ticketId]);
-      this.save();
-      return true;
+    const target = String(ticketId || '').trim().toUpperCase();
+    const removedTicket = this.state.tickets.find((t) => t.ticketId.toUpperCase() === target);
+    if (!removedTicket) return false;
+
+    const canonicalId = removedTicket.ticketId;
+    this.state.tickets = this.state.tickets.filter((t) => t.ticketId !== canonicalId);
+    const removedSubs = this.state.submissions.filter(
+      (sub) => sub.ticketId.toUpperCase() === target
+    );
+    this.state.submissions = this.state.submissions.filter(
+      (sub) => sub.ticketId.toUpperCase() !== target
+    );
+
+    const keys = this._kvKeys();
+    this._queueKv(['HDEL', keys.tickets, canonicalId]);
+    if (removedSubs.length > 0) {
+      this._queueKv([
+        'HDEL',
+        keys.submissions,
+        ...removedSubs.map((sub) => `${sub.sessionId}:${sub.ticketId}`),
+      ]);
     }
-    return false;
+
+    for (const ses of this.state.sessions) {
+      if (ses.roundResult && Array.isArray(ses.roundResult.winnerTicketIds)) {
+        const filteredIds = ses.roundResult.winnerTicketIds.filter(
+          (id) => String(id).toUpperCase() !== target
+        );
+        if (filteredIds.length !== ses.roundResult.winnerTicketIds.length) {
+          ses.roundResult = {
+            ...ses.roundResult,
+            winnerTicketIds: filteredIds,
+          };
+          this._queueKv(['HSET', keys.sessions, ses.id, JSON.stringify(ses)]);
+        }
+      }
+    }
+
+    this.save();
+    return true;
   }
 
   getSessions() {
@@ -488,8 +545,65 @@ class GameStore {
     );
   }
 
+  async recordSubmissionAtomic(submission, selectedNumber) {
+    const existing = this.findSubmission(submission.sessionId, submission.ticketId);
+    if (existing) {
+      return { duplicate: true, existing };
+    }
+
+    // Optimistically push synchronously before any await so concurrent same-process requests see it
+    this.state.submissions.push(submission);
+    const keys = this._kvKeys();
+    const field = `${submission.sessionId}:${submission.ticketId}`;
+
+    if (this._remoteKv) {
+      let pipelineRes;
+      try {
+        pipelineRes = await this._runKvPipeline([
+          ['HSETNX', keys.submissions, field, JSON.stringify(submission)],
+        ]);
+      } catch (err) {
+        this.state.submissions = this.state.submissions.filter((s) => s.id !== submission.id);
+        throw err;
+      }
+
+      const inserted = Number(pipelineRes?.[0]?.result ?? 0);
+      if (inserted === 0) {
+        this.state.submissions = this.state.submissions.filter((s) => s.id !== submission.id);
+        await this.syncFromRemote();
+        return {
+          duplicate: true,
+          existing: this.findSubmission(submission.sessionId, submission.ticketId),
+        };
+      }
+
+      const ticket = this.findTicketById(submission.ticketId);
+      const consumedNum =
+        selectedNumber !== null && selectedNumber !== undefined ? Number(selectedNumber) : NaN;
+      if (ticket && Number.isInteger(consumedNum)) {
+        ticket.usedNumbers = [...new Set([...(ticket.usedNumbers || []), consumedNum])];
+        await this._runKvPipeline([['HSET', keys.tickets, ticket.ticketId, JSON.stringify(ticket)]]);
+      }
+      this._persist(this.state);
+      return { duplicate: false, submission };
+    }
+
+    const ticket = this.findTicketById(submission.ticketId);
+    const consumedNum =
+      selectedNumber !== null && selectedNumber !== undefined ? Number(selectedNumber) : NaN;
+    if (ticket && Number.isInteger(consumedNum)) {
+      ticket.usedNumbers = [...new Set([...(ticket.usedNumbers || []), consumedNum])];
+    }
+    this.save();
+    return { duplicate: false, submission };
+  }
+
   resetAll() {
-    this.state = createDefaultState();
+    const preservedAuth = this.state.auth || null;
+    this.state = {
+      ...createDefaultState(),
+      auth: preservedAuth,
+    };
     if (fs.existsSync(this.dir)) {
       for (const entry of fs.readdirSync(this.dir)) {
         const fullPath = path.join(this.dir, entry);

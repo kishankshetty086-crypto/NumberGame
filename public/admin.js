@@ -7,7 +7,65 @@ const state = {
   leaderboard: null,
   storage: null,
   ticketDisplayLimit: 100,
+  authNeedsSetup: false,
 };
+
+function showAuthGate(status) {
+  state.authNeedsSetup = Boolean(status?.needsSetup);
+  document.getElementById('admin-app-shell').style.display = 'none';
+  document.getElementById('admin-auth-gate').style.display = 'block';
+  const titleEl = document.getElementById('auth-title');
+  const subEl = document.getElementById('auth-subtitle');
+  const btnEl = document.getElementById('auth-submit-btn');
+  const warnEl = document.getElementById('auth-storage-warning');
+
+  if (state.authNeedsSetup) {
+    titleEl.textContent = 'Create Admin Password';
+    subEl.textContent =
+      'Set a password (4–128 chars) to protect secret codes, ticket management, scoring, and resets.';
+    btnEl.textContent = 'Save Password & Enter';
+  } else {
+    titleEl.textContent = 'Admin Login';
+    subEl.textContent =
+      'Enter the admin password to manage tickets, sessions, secret codes, and exports.';
+    btnEl.textContent = 'Unlock Admin Dashboard';
+  }
+
+  if (status?.storage && status.storage.persistent === false) {
+    warnEl.innerHTML =
+      '<div class="alert alert-error" style="font-size:12.5px;">' +
+      '<strong>Temporary Serverless Storage Active:</strong> Set <code>ADMIN_PASSWORD</code> and connect <strong>Upstash Redis / Vercel KV</strong> in Vercel Project Settings for shared, persistent storage.' +
+      '</div>';
+  } else {
+    warnEl.innerHTML = '';
+  }
+}
+
+function showAdminDashboard() {
+  document.getElementById('admin-auth-gate').style.display = 'none';
+  document.getElementById('admin-app-shell').style.display = 'block';
+}
+
+async function api(url, options = {}) {
+  const resp = await fetch(url, {
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    if (resp.status === 401) {
+      const authStatus = await fetch('/api/auth/status', { cache: 'no-store' })
+        .then((r) => r.json())
+        .catch(() => ({ needsSetup: Boolean(data.needsSetup) }));
+      showAuthGate(authStatus);
+    }
+    const err = new Error(data.error || `Request failed (${resp.status})`);
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
 
 function esc(str) {
   return String(str ?? '')
@@ -23,21 +81,6 @@ function showToast(message, type = 'info') {
   setTimeout(() => {
     if (el.firstChild) el.innerHTML = '';
   }, 6000);
-}
-
-async function api(url, options = {}) {
-  const resp = await fetch(url, {
-    cache: 'no-store',
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options,
-  });
-  const data = await resp.json();
-  if (!resp.ok) {
-    const err = new Error(data.error || `Request failed (${resp.status})`);
-    err.status = resp.status;
-    throw err;
-  }
-  return data;
 }
 
 // Tabs
@@ -305,7 +348,17 @@ document.getElementById('tickets-container').addEventListener('click', (e) => {
 });
 
 window.reduceTicket = async function (ticketId, currentCount) {
-  const input = prompt(`Reduce ticket ${ticketId} from ${currentCount} numbers to how many numbers? (1 - ${currentCount - 1})`, String(currentCount - 1));
+  const existing = state.tickets.find((t) => t.ticketId === ticketId);
+  const usedCount = existing?.usedNumbers?.length || 0;
+  const minTarget = Math.max(1, usedCount);
+  if (minTarget >= currentCount) {
+    showToast(`Ticket ${ticketId} cannot be reduced further (${usedCount} used number(s) must stay).`, 'error');
+    return;
+  }
+  const input = prompt(
+    `Reduce ticket ${ticketId} from ${currentCount} numbers to how many total numbers? (${minTarget} - ${currentCount - 1})`,
+    String(currentCount - 1)
+  );
   if (!input) return;
   const targetCount = Number(input);
   try {
@@ -448,7 +501,9 @@ function renderSessions() {
               ${
                 isActive
                   ? `<button type="button" class="btn btn-danger btn-sm" data-action="expire" data-id="${esc(s.id)}">Expire / Close Session</button>`
-                  : `<button type="button" class="btn btn-success btn-sm" data-action="reopen" data-id="${esc(s.id)}">Reopen Session</button>`
+                  : s.roundResult
+                    ? `<span class="pill" title="Scored sessions cannot be reopened">Locked (Scored)</span>`
+                    : `<button type="button" class="btn btn-success btn-sm" data-action="reopen" data-id="${esc(s.id)}">Reopen Session</button>`
               }
               <button type="button" class="btn btn-danger btn-sm" data-action="delete" data-id="${esc(s.id)}">Delete</button>
             </div>
@@ -624,16 +679,25 @@ function renderEvalSessionSelect() {
 
 async function runWinnerEvaluation(mode, extra = {}) {
   const sessionId = document.getElementById('eval-session-select').value;
-  const pointsPerWin = Number(document.getElementById('eval-points').value || 1);
+  const pointsPerWin = Number(document.getElementById('eval-points').value);
   const saveToLeaderboard = document.getElementById('save-to-leaderboard').checked;
   if (!sessionId) {
     showToast('Please create and select a session first.', 'error');
     return;
   }
+  const existingSession = state.sessions.find((s) => s.id === sessionId);
+  let confirmOverwrite = false;
+  if (saveToLeaderboard && existingSession && existingSession.roundResult) {
+    const ok = confirm(
+      `Session "${existingSession.name}" has already been scored and saved to the leaderboard. Overwrite the existing winner result?`
+    );
+    if (!ok) return;
+    confirmOverwrite = true;
+  }
   try {
     const data = await api(`/api/sessions/${encodeURIComponent(sessionId)}/evaluate`, {
       method: 'POST',
-      body: JSON.stringify({ mode, pointsPerWin, saveToLeaderboard, ...extra }),
+      body: JSON.stringify({ mode, pointsPerWin, saveToLeaderboard, confirmOverwrite, ...extra }),
     });
     renderWinnerResults(data);
     if (saveToLeaderboard) {
@@ -934,4 +998,54 @@ async function clearAllCache() {
 document.getElementById('btn-clear-cache-top').addEventListener('click', clearAllCache);
 document.getElementById('btn-clear-cache-tab').addEventListener('click', clearAllCache);
 
-refreshAll();
+async function bootAdmin() {
+  try {
+    const resp = await fetch('/api/auth/status', { cache: 'no-store' });
+    const status = await resp.json();
+    state.storage = status.storage || state.storage;
+    if (!status.authenticated) {
+      showAuthGate(status);
+      return;
+    }
+    showAdminDashboard();
+    await refreshAll();
+  } catch {
+    showAuthGate({ needsSetup: false });
+  }
+}
+
+document.getElementById('admin-auth-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errorEl = document.getElementById('auth-error');
+  const password = document.getElementById('admin-password-input').value;
+  errorEl.innerHTML = '';
+  try {
+    const endpoint = state.authNeedsSetup ? '/api/auth/setup' : '/api/auth/login';
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Authentication failed');
+    }
+    document.getElementById('admin-password-input').value = '';
+    showAdminDashboard();
+    await refreshAll();
+  } catch (err) {
+    errorEl.innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+  }
+});
+
+document.getElementById('btn-admin-logout').addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST', cache: 'no-store' }).catch(() => {});
+  state.tickets = [];
+  state.sessions = [];
+  state.submissions = [];
+  state.leaderboard = null;
+  await bootAdmin();
+});
+
+bootAdmin();

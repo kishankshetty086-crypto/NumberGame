@@ -11,6 +11,14 @@ const { toCsv, toXlsxBuffer } = require('../src/exportData');
 const { GameStore } = require('../src/store');
 const { createApp } = require('../src/gameServer');
 
+function createAuthedApp(store, adminPassword = 'bulk-admin-secret') {
+  const rawApp = createApp({ store, adminPassword });
+  return (req, res) => {
+    req.headers = { 'x-admin-password': adminPassword, ...(req.headers || {}) };
+    return rawApp(req, res);
+  };
+}
+
 function invokeApp(app, method, reqPath, body = null, opts = {}) {
   return new Promise((resolve, reject) => {
     const rawBody =
@@ -27,6 +35,11 @@ function invokeApp(app, method, reqPath, body = null, opts = {}) {
       'content-type': 'application/json',
       ...(opts.ip ? { 'x-forwarded-for': opts.ip } : {}),
     };
+    if (opts.headers) {
+      for (const [k, v] of Object.entries(opts.headers)) {
+        req.headers[k.toLowerCase()] = v;
+      }
+    }
     req.socket = { remoteAddress: opts.ip || '127.0.0.1' };
 
     const chunks = [];
@@ -81,7 +94,7 @@ function parseZipEntries(zipBuf) {
 test('Big basket generation (500 tickets): unique IDs/codes, 1-per-set distribution, delete + seq naming, and reduction', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-bulk1-'));
   const store = new GameStore(path.join(tmpDir, 'db.json'));
-  const app = createApp({ store });
+  const app = createAuthedApp(store);
 
   try {
     const genResp = await invokeApp(app, 'POST', '/api/tickets/generate', {
@@ -144,7 +157,7 @@ test('Big basket generation (500 tickets): unique IDs/codes, 1-per-set distribut
 test('HTTP validation & security guards return 400/403/409/429 cleanly (never 500)', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-bulk2-'));
   const store = new GameStore(path.join(tmpDir, 'db.json'));
-  const app = createApp({ store });
+  const app = createAuthedApp(store);
 
   try {
     // Malformed JSON -> 400
@@ -252,7 +265,7 @@ test('HTTP validation & security guards return 400/403/409/429 cleanly (never 50
 test('Big-basket tournament (500 tickets x 4 rounds = 2000 submissions), session deletion rollback, leaderboard & exports', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-bulk3-'));
   const store = new GameStore(path.join(tmpDir, 'db.json'));
-  const app = createApp({ store });
+  const app = createAuthedApp(store);
 
   try {
     // 1. Generate 500 tickets (including XML/CSV special chars on first 2 players)
@@ -444,6 +457,13 @@ test('High-concurrency bulk submissions (200 parallel requests across 3 instance
       }
       return { result: 1 };
     }
+    if (op === 'HSETNX') {
+      if (!hashes.has(key)) hashes.set(key, new Map());
+      const map = hashes.get(key);
+      if (map.has(cmd[2])) return { result: 0 };
+      map.set(cmd[2], cmd[3]);
+      return { result: 1 };
+    }
     if (op === 'HDEL') {
       const map = hashes.get(key);
       let count = 0;
@@ -487,7 +507,7 @@ test('High-concurrency bulk submissions (200 parallel requests across 3 instance
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-bulk-kv-'));
   try {
-    const adminApp = createApp({ store: new GameStore(path.join(tmpDir, 'admin.json')) });
+    const adminApp = createAuthedApp(new GameStore(path.join(tmpDir, 'admin.json')));
     const gen = await invokeApp(adminApp, 'POST', '/api/tickets/generate', { count: 200 });
     assert.equal(gen.status, 201);
     const tickets = gen.json.tickets;
@@ -497,9 +517,9 @@ test('High-concurrency bulk submissions (200 parallel requests across 3 instance
     const session = sesResp.json.session;
 
     const instances = [
-      createApp({ store: new GameStore(path.join(tmpDir, 'w1.json')) }),
-      createApp({ store: new GameStore(path.join(tmpDir, 'w2.json')) }),
-      createApp({ store: new GameStore(path.join(tmpDir, 'w3.json')) }),
+      createApp({ store: new GameStore(path.join(tmpDir, 'w1.json')), adminPassword: 'bulk-admin-secret' }),
+      createApp({ store: new GameStore(path.join(tmpDir, 'w2.json')), adminPassword: 'bulk-admin-secret' }),
+      createApp({ store: new GameStore(path.join(tmpDir, 'w3.json')), adminPassword: 'bulk-admin-secret' }),
     ];
 
     // Dispatch all 200 submissions concurrently across the 3 instances
@@ -524,7 +544,7 @@ test('High-concurrency bulk submissions (200 parallel requests across 3 instance
     }
 
     // Fresh reader instance sees all 200 submissions and all 200 usedNumbers updates
-    const readerApp = createApp({ store: new GameStore(path.join(tmpDir, 'reader.json')) });
+    const readerApp = createAuthedApp(new GameStore(path.join(tmpDir, 'reader.json')));
     const stateResp = await invokeApp(readerApp, 'GET', '/api/state');
     assert.equal(stateResp.status, 200);
     assert.equal(stateResp.json.submissions.length, 200);
@@ -538,6 +558,313 @@ test('High-concurrency bulk submissions (200 parallel requests across 3 instance
     else process.env.UPSTASH_REDIS_REST_URL = prevUrl;
     if (prevTok === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
     else process.env.UPSTASH_REDIS_REST_TOKEN = prevTok;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Security & atomicity: admin login/setup, secret code hiding, and simultaneous double-submit protection', async () => {
+  const strings = new Map();
+  const hashes = new Map();
+  const prevFetch = globalThis.fetch;
+
+  function execCmd(cmd) {
+    const op = cmd[0];
+    const key = cmd[1];
+    if (op === 'GET') return { result: strings.get(key) ?? null };
+    if (op === 'SET') {
+      strings.set(key, cmd[2]);
+      return { result: 'OK' };
+    }
+    if (op === 'HSET') {
+      if (!hashes.has(key)) hashes.set(key, new Map());
+      const map = hashes.get(key);
+      for (let i = 2; i < cmd.length; i += 2) {
+        map.set(cmd[i], cmd[i + 1]);
+      }
+      return { result: 1 };
+    }
+    if (op === 'HSETNX') {
+      if (!hashes.has(key)) hashes.set(key, new Map());
+      const map = hashes.get(key);
+      if (map.has(cmd[2])) return { result: 0 };
+      map.set(cmd[2], cmd[3]);
+      return { result: 1 };
+    }
+    if (op === 'HGETALL') {
+      const map = hashes.get(key);
+      if (!map || map.size === 0) return { result: [] };
+      const out = [];
+      for (const [f, v] of map.entries()) out.push(f, v);
+      return { result: out };
+    }
+    if (op === 'DEL') {
+      for (let i = 1; i < cmd.length; i++) {
+        strings.delete(cmd[i]);
+        hashes.delete(cmd[i]);
+      }
+      return { result: 1 };
+    }
+    return { result: 1 };
+  }
+
+  globalThis.fetch = async (url, options = {}) => {
+    assert.ok(String(url).endsWith('/pipeline'));
+    const cmds = JSON.parse(options.body);
+    return {
+      ok: true,
+      async json() {
+        return cmds.map(execCmd);
+      },
+    };
+  };
+
+  const remoteKv = { url: 'https://mock-auth.upstash.io', token: 'tok', key: 'auth_race_game' };
+  const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-sec1-'));
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-sec2-'));
+
+  try {
+    const app1 = createApp({ store: new GameStore(path.join(dir1, 'db.json'), { remoteKv }) });
+    const app2 = createApp({ store: new GameStore(path.join(dir2, 'db.json'), { remoteKv }) });
+
+    // Before setup, all admin endpoints must reject with 401 and leak 0 secret codes
+    for (const [m, p] of [
+      ['GET', '/api/state'],
+      ['GET', '/api/tickets'],
+      ['GET', '/api/sessions'],
+      ['POST', '/api/reset'],
+      ['GET', '/api/export/submissions.csv'],
+    ]) {
+      const r = await invokeApp(app1, m, p);
+      assert.equal(r.status, 401, `${m} ${p} should require auth`);
+    }
+
+    // Complete first-time admin setup on app1 -> cookie authenticates across app2 too (shared Redis auth)
+    const setupResp = await invokeApp(app1, 'POST', '/api/auth/setup', { password: 'MyStrongPassword!' });
+    assert.equal(setupResp.status, 201);
+    const setCookie = setupResp.headers['Set-Cookie'];
+    assert.ok(setCookie && setCookie.includes('ng_admin='));
+    const cookiePair = setCookie.split(';')[0];
+
+    // Setup cannot be overwritten once configured
+    const setupAgain = await invokeApp(app2, 'POST', '/api/auth/setup', { password: 'HijackedPassword!' });
+    assert.equal(setupAgain.status, 403);
+
+    // Cookie generated on app1 grants admin access on app2
+    const genResp = await invokeApp(
+      app2,
+      'POST',
+      '/api/tickets/generate',
+      { count: 1, playerNames: ['Race Player'] },
+      { headers: { Cookie: cookiePair } }
+    );
+    assert.equal(genResp.status, 201);
+    const ticket = genResp.json.tickets[0];
+
+    const sesResp = await invokeApp(
+      app2,
+      'POST',
+      '/api/sessions',
+      { name: 'Race Round' },
+      { headers: { Cookie: cookiePair } }
+    );
+    assert.equal(sesResp.status, 201);
+    const session = sesResp.json.session;
+
+    // Unauthenticated call still fails with 401 even though tickets exist
+    const leakCheck = await invokeApp(app2, 'GET', '/api/state');
+    assert.equal(leakCheck.status, 401);
+    assert.ok(!leakCheck.text.includes(ticket.secretCode));
+
+    // Player verify & submit work without admin cookie and never include secretCode in response
+    const verifyPlayer = await invokeApp(app1, 'POST', `/api/play/${session.token}/verify`, {
+      secretCode: `  ${ticket.secretCode.toLowerCase()}  `,
+    });
+    assert.equal(verifyPlayer.status, 200);
+    assert.ok(!verifyPlayer.text.includes(ticket.secretCode));
+
+    // Simultaneous double-submit for the SAME ticket hitting app1 and app2 concurrently -> strictly one 201 and one 409
+    const [race1, race2] = await Promise.all([
+      invokeApp(app1, 'POST', `/api/play/${session.token}/submit`, {
+        ticketId: ticket.ticketId,
+        secretCode: ticket.secretCode,
+        selectedNumber: ticket.numbers[0],
+      }),
+      invokeApp(app2, 'POST', `/api/play/${session.token}/submit`, {
+        ticketId: ticket.ticketId,
+        secretCode: ticket.secretCode,
+        selectedNumber: ticket.numbers[1],
+      }),
+    ]);
+    const statuses = [race1.status, race2.status].sort((a, b) => a - b);
+    assert.deepEqual(statuses, [201, 409]);
+
+    const finalState = await invokeApp(app2, 'GET', '/api/state', null, {
+      headers: { Cookie: cookiePair },
+    });
+    assert.equal(finalState.json.submissions.length, 1);
+    assert.equal(finalState.json.tickets[0].usedNumbers.length, 1);
+
+    // Wrong login & logout
+    const badLogin = await invokeApp(app1, 'POST', '/api/auth/login', { password: 'wrong' });
+    assert.equal(badLogin.status, 401);
+    const logoutResp = await invokeApp(app1, 'POST', '/api/auth/logout');
+    assert.equal(logoutResp.status, 200);
+    assert.ok(logoutResp.headers['Set-Cookie'].includes('Max-Age=0'));
+  } finally {
+    globalThis.fetch = prevFetch;
+    fs.rmSync(dir1, { recursive: true, force: true });
+    fs.rmSync(dir2, { recursive: true, force: true });
+  }
+});
+
+test('QA audit regression checks (#4-#14): scoring locks, delete/shrink cleanup, strict validation, natural sort & play UI', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'office-game-qa-'));
+  const store = new GameStore(path.join(tmpDir, 'db.json'));
+  const app = createAuthedApp(store);
+
+  try {
+    // Validation: no ranges ticked, extra names, overlong player/session names -> 400
+    const emptySets = await invokeApp(app, 'POST', '/api/tickets/generate', {
+      count: 1,
+      perSetCheck: true,
+      selectedSets: [],
+    });
+    assert.equal(emptySets.status, 400);
+
+    const extraNames = await invokeApp(app, 'POST', '/api/tickets/generate', {
+      count: 2,
+      playerNames: ['Alice', 'Bob', 'Charlie'],
+    });
+    assert.equal(extraNames.status, 400);
+
+    const longName = await invokeApp(app, 'POST', '/api/tickets/generate', {
+      count: 1,
+      playerNames: ['A'.repeat(61)],
+    });
+    assert.equal(longName.status, 400);
+
+    const longSession = await invokeApp(app, 'POST', '/api/sessions', {
+      name: 'R'.repeat(101),
+    });
+    assert.equal(longSession.status, 400);
+
+    // Create players including "Player 10" and "Player 2" to verify natural tie ordering
+    const gen = await invokeApp(app, 'POST', '/api/tickets/generate', {
+      count: 4,
+      playerNames: ['Alice', 'Bob', 'Player 10', 'Player 2'],
+    });
+    assert.equal(gen.status, 201);
+    const [alice, bob, p10, p2] = gen.json.tickets;
+
+    const s1 = (await invokeApp(app, 'POST', '/api/sessions', { name: 'Round 1' })).json.session;
+    const s2 = (await invokeApp(app, 'POST', '/api/sessions', { name: 'Round 2' })).json.session;
+
+    // Play Round 1: Alice submits least (decade 0), Bob submits highest (decade 9)
+    await invokeApp(app, 'POST', `/api/play/${s1.token}/submit`, {
+      ticketId: alice.ticketId,
+      secretCode: alice.secretCode,
+      selectedNumber: alice.numbers[0],
+    });
+    await invokeApp(app, 'POST', `/api/play/${s1.token}/submit`, {
+      ticketId: bob.ticketId,
+      secretCode: bob.secretCode,
+      selectedNumber: bob.numbers[9],
+    });
+    await invokeApp(app, 'POST', `/api/play/${s1.token}/submit`, {
+      ticketId: p10.ticketId,
+      secretCode: p10.secretCode,
+      selectedNumber: p10.numbers[4],
+    });
+    await invokeApp(app, 'POST', `/api/play/${s1.token}/submit`, {
+      ticketId: p2.ticketId,
+      secretCode: p2.secretCode,
+      selectedNumber: p2.numbers[5],
+    });
+
+    await invokeApp(app, 'POST', `/api/sessions/${s1.id}/expire`);
+
+    // Points 0 or negative must be rejected with 400 instead of silently saved as 1
+    for (const badPts of [0, -10, 1.5]) {
+      const r = await invokeApp(app, 'POST', `/api/sessions/${s1.id}/evaluate`, {
+        mode: 'least',
+        pointsPerWin: badPts,
+      });
+      assert.equal(r.status, 400, `Expected 400 for pointsPerWin=${badPts}`);
+    }
+
+    // Score Round 1 cleanly as least -> Alice wins
+    const eval1 = await invokeApp(app, 'POST', `/api/sessions/${s1.id}/evaluate`, {
+      mode: 'least',
+      pointsPerWin: 3,
+      saveToLeaderboard: true,
+    });
+    assert.equal(eval1.status, 200);
+    assert.equal(eval1.json.winners[0].playerName, 'Alice');
+
+    // Re-scoring silently without confirmOverwrite -> 409 Conflict
+    const rescoreBlocked = await invokeApp(app, 'POST', `/api/sessions/${s1.id}/evaluate`, {
+      mode: 'highest',
+      pointsPerWin: 3,
+      saveToLeaderboard: true,
+    });
+    assert.equal(rescoreBlocked.status, 409);
+
+    // Scored session cannot be reopened -> 400
+    const reopenBlocked = await invokeApp(app, 'POST', `/api/sessions/${s1.id}/reopen`);
+    assert.equal(reopenBlocked.status, 400);
+
+    // Explicitly confirming overwrite works if admin confirms
+    const rescoreConfirmed = await invokeApp(app, 'POST', `/api/sessions/${s1.id}/evaluate`, {
+      mode: 'highest',
+      pointsPerWin: 5,
+      saveToLeaderboard: true,
+      confirmOverwrite: true,
+    });
+    assert.equal(rescoreConfirmed.status, 200);
+    assert.equal(rescoreConfirmed.json.winners[0].playerName, 'Bob');
+
+    // Alice plays Round 2 too (2 used numbers now on Alice)
+    await invokeApp(app, 'POST', `/api/play/${s2.token}/submit`, {
+      ticketId: alice.ticketId,
+      secretCode: alice.secretCode,
+      selectedNumber: alice.numbers[8],
+    });
+
+    // Shrinking Alice below her 2 already-used numbers -> 400
+    const shrinkTooSmall = await invokeApp(app, 'PATCH', `/api/tickets/${alice.ticketId}/reduce`, {
+      targetCount: 1,
+    });
+    assert.equal(shrinkTooSmall.status, 400);
+
+    // Shrinking Alice to 4 numbers preserves BOTH already-used numbers on the ticket
+    const shrinkOk = await invokeApp(app, 'PATCH', `/api/tickets/${alice.ticketId}/reduce`, {
+      targetCount: 4,
+    });
+    assert.equal(shrinkOk.status, 200);
+    assert.equal(shrinkOk.json.ticket.numbers.length, 4);
+    assert.ok(shrinkOk.json.ticket.numbers.includes(alice.numbers[0]));
+    assert.ok(shrinkOk.json.ticket.numbers.includes(alice.numbers[8]));
+    assert.equal(shrinkOk.json.ticket.usedNumbers.length, 2);
+
+    // Deleting Bob removes Bob completely from the leaderboard & submissions
+    const delBob = await invokeApp(app, 'DELETE', `/api/tickets/${bob.ticketId}`);
+    assert.equal(delBob.status, 200);
+    const lbAfterDel = await invokeApp(app, 'GET', '/api/leaderboard');
+    assert.equal(lbAfterDel.status, 200);
+    assert.ok(!lbAfterDel.json.leaderboard.some((r) => r.ticketId === bob.ticketId));
+
+    // Natural sort order puts "Player 2" before "Player 10" among tied 0-point rows
+    const zeroPointNames = lbAfterDel.json.leaderboard.map((r) => r.playerName);
+    assert.ok(zeroPointNames.indexOf('Player 2') < zeroPointNames.indexOf('Player 10'));
+
+    // Verify player HTML/JS allow paste & DevTools without trapping, and distinguish invalid links
+    const playHtml = fs.readFileSync(path.join(__dirname, '..', 'public', 'play.html'), 'utf8');
+    const playJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'play.js'), 'utf8');
+    assert.ok(!playHtml.includes('debug-lock-overlay'));
+    assert.ok(!playJs.includes('debugger'));
+    assert.ok(!playJs.includes('contextmenu'));
+    assert.ok(playJs.includes('showInvalidLink'));
+  } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

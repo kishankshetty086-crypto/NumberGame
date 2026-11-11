@@ -32,13 +32,44 @@ const MIME_TYPES = {
   '.png': 'image/png',
 };
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    ...extraHeaders,
   });
   res.end(body);
+}
+
+function getHeader(req, lowerName) {
+  if (!req || !req.headers) return '';
+  if (req.headers[lowerName] !== undefined) return req.headers[lowerName];
+  const foundKey = Object.keys(req.headers).find((k) => k.toLowerCase() === lowerName);
+  return foundKey ? req.headers[foundKey] : '';
+}
+
+function parseCookies(req) {
+  const header = String(getHeader(req, 'cookie') || '');
+  const map = {};
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    try {
+      map[key] = decodeURIComponent(val);
+    } catch {
+      map[key] = val;
+    }
+  }
+  return map;
+}
+
+function safeEqualStrings(a, b) {
+  const bufA = crypto.createHash('sha256').update(String(a || '')).digest();
+  const bufB = crypto.createHash('sha256').update(String(b || '')).digest();
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 function sendHtml(res, statusCode, html, extraHeaders = {}) {
@@ -115,10 +146,100 @@ function resolvePublicDir() {
   return candidates[0];
 }
 
-function createApp({ store } = {}) {
+function createApp({ store, adminPassword } = {}) {
   const gameStore = store || new GameStore();
   const publicDir = resolvePublicDir();
   const failedAttempts = new Map();
+  const staticAdminPassword = String(
+    adminPassword !== undefined ? adminPassword : process.env.ADMIN_PASSWORD || ''
+  ).trim();
+  const ADMIN_COOKIE_NAME = 'ng_admin';
+
+  function getAuthSecret() {
+    if (staticAdminPassword) {
+      return crypto.createHash('sha256').update(`ng-admin:${staticAdminPassword}`).digest();
+    }
+    const stored = gameStore.getAuth();
+    if (stored && stored.sessionSecret) {
+      return Buffer.from(stored.sessionSecret, 'hex');
+    }
+    return null;
+  }
+
+  function isAuthConfigured() {
+    if (staticAdminPassword) return true;
+    const stored = gameStore.getAuth();
+    return Boolean(stored && stored.passwordHash && stored.salt && stored.sessionSecret);
+  }
+
+  function verifyAdminPassword(candidate) {
+    const pw = String(candidate || '');
+    if (!pw) return false;
+    if (staticAdminPassword) {
+      return safeEqualStrings(pw, staticAdminPassword);
+    }
+    const stored = gameStore.getAuth();
+    if (!stored || !stored.passwordHash || !stored.salt) return false;
+    const derived = crypto.scryptSync(pw, stored.salt, 32);
+    const expected = Buffer.from(stored.passwordHash, 'hex');
+    return derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
+  }
+
+  function createSessionCookieValue() {
+    const secret = getAuthSecret();
+    if (!secret) return '';
+    const exp = Date.now() + 12 * 60 * 60 * 1000;
+    const payload = Buffer.from(
+      JSON.stringify({ exp, nonce: crypto.randomBytes(8).toString('hex') }),
+      'utf8'
+    ).toString('base64url');
+    const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+    return `${payload}.${sig}`;
+  }
+
+  function verifySessionCookieValue(token) {
+    if (!token || typeof token !== 'string') return false;
+    const secret = getAuthSecret();
+    if (!secret) return false;
+    const dotIdx = token.indexOf('.');
+    if (dotIdx <= 0) return false;
+    const payload = token.slice(0, dotIdx);
+    const sig = token.slice(dotIdx + 1);
+    const expectedSig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expectedSig);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+    try {
+      const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      return Number(parsed.exp) > Date.now();
+    } catch {
+      return false;
+    }
+  }
+
+  function buildAuthCookieHeader(value, req, maxAgeSeconds = 43200) {
+    const proto = String(req.headers?.['x-forwarded-proto'] || '').split(',')[0].trim();
+    const secure = proto === 'https' ? '; Secure' : '';
+    return `${ADMIN_COOKIE_NAME}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
+  }
+
+  function isAdminAuthorized(req) {
+    if (!isAuthConfigured()) return false;
+    const cookies = parseCookies(req);
+    if (cookies[ADMIN_COOKIE_NAME] && verifySessionCookieValue(cookies[ADMIN_COOKIE_NAME])) {
+      return true;
+    }
+    const headerPw = getHeader(req, 'x-admin-password');
+    if (headerPw && verifyAdminPassword(headerPw)) {
+      return true;
+    }
+    const authHeader = String(getHeader(req, 'authorization') || '');
+    if (authHeader.toLowerCase().startsWith('bearer ')) {
+      const bearer = authHeader.slice(7).trim();
+      if (verifyAdminPassword(bearer)) return true;
+    }
+    return false;
+  }
 
   function getClientKey(req, token) {
     const ip =
@@ -220,407 +341,82 @@ function createApp({ store } = {}) {
         }
       }
 
-      // ----------------- TICKETS API -----------------
-      if (method === 'GET' && pathname === '/api/tickets') {
-        return sendJson(res, 200, {
-          decadeSets: DECADE_SETS,
-          tickets: gameStore.getTickets(),
-        });
-      }
-
-      if (method === 'POST' && pathname === '/api/tickets/generate') {
-        const body = await readJsonBody(req);
-        const rawCount = body.count === undefined ? 1 : Number(body.count);
-        if (!Number.isInteger(rawCount) || rawCount < 1 || rawCount > 1000) {
-          return sendJson(res, 400, { error: 'Ticket count must be an integer between 1 and 1000.' });
-        }
-        const count = rawCount;
-        const numbersPerTicket = Number(body.numbersPerTicket ?? 10);
-        const perSetCheck = body.perSetCheck !== false;
-        const selectedSets = Array.isArray(body.selectedSets)
-          ? body.selectedSets
-          : Array.isArray(body.allowedSets)
-            ? body.allowedSets
-            : null;
-        const excludedNumbers = Array.isArray(body.excludedNumbers) ? body.excludedNumbers : [];
-        const playerNames = Array.isArray(body.playerNames) ? body.playerNames : [];
-
-        const existingIds = new Set(gameStore.getTickets().map((t) => t.ticketId));
-        const existingCodes = new Set(gameStore.getTickets().map((t) => t.secretCode));
-        let seq = gameStore.state.nextTicketSeq;
-
-        const created = [];
-        for (let i = 0; i < count; i++) {
-          const ticketSeq = seq;
-          const ticketId = generateTicketId(existingIds, ticketSeq);
-          seq += 1;
-          existingIds.add(ticketId);
-
-          const secretCode = generateSecretCode(existingCodes);
-          existingCodes.add(secretCode);
-
-          let numbers;
-          try {
-            numbers = generateTicketNumbers({
-              count: numbersPerTicket,
-              perSetCheck,
-              selectedSets,
-              excludedNumbers,
-            });
-          } catch (genErr) {
-            return sendJson(res, 400, { error: genErr.message });
-          }
-          const check = validateTicketSetDistribution(numbers);
-
-          const rawName = playerNames[i];
-          const playerName =
-            rawName && String(rawName).trim()
-              ? String(rawName).trim()
-              : `Player ${ticketSeq}`;
-
-          created.push({
-            ticketId,
-            playerName,
-            secretCode,
-            numbers,
-            usedNumbers: [],
-            perSetCheck,
-            setValidation: check,
-            createdAt: new Date().toISOString(),
-          });
-        }
-
-        gameStore.addTickets(created);
-        return commitJson(res, 201, { tickets: created });
-      }
-
-      const ticketReduceMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/reduce$/);
-      if (method === 'PATCH' && ticketReduceMatch) {
-        const ticketId = decodeURIComponent(ticketReduceMatch[1]);
-        const ticket = gameStore.findTicketById(ticketId);
-        if (!ticket) return sendJson(res, 404, { error: 'Ticket not found' });
-
-        const body = await readJsonBody(req);
-        const targetCount = Number(body.targetCount);
-        if (!Number.isInteger(targetCount) || targetCount < 1 || targetCount >= ticket.numbers.length) {
-          return sendJson(res, 400, {
-            error: `targetCount must be an integer between 1 and ${ticket.numbers.length - 1}`,
-          });
-        }
-
-        const available = ticket.numbers.filter((n) => !(ticket.usedNumbers || []).includes(n));
-        if (available.length < targetCount) {
-          return sendJson(res, 400, {
-            error: `Ticket only has ${available.length} unused numbers available.`,
-          });
-        }
-
-        const copy = [...available];
-        for (let i = copy.length - 1; i > 0; i--) {
-          const j = crypto.randomInt(0, i + 1);
-          [copy[i], copy[j]] = [copy[j], copy[i]];
-        }
-        const reduced = copy.slice(0, targetCount).sort((a, b) => a - b);
-        const updated = gameStore.updateTicket(ticket.ticketId, {
-          numbers: reduced,
-          setValidation: validateTicketSetDistribution(reduced),
-        });
-        return commitJson(res, 200, { ticket: updated });
-      }
-
-      const ticketHtmlMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/html$/);
-      if (method === 'GET' && ticketHtmlMatch) {
-        const ticketId = decodeURIComponent(ticketHtmlMatch[1]);
-        const ticket = gameStore.findTicketById(ticketId);
-        if (!ticket) return sendJson(res, 404, { error: 'Ticket not found' });
-
-        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
-        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
-        const html = renderTicketHtml(ticket, { activeSessionUrl });
-        const download = urlObj.searchParams.get('download') === '1';
-        const headers = download
-          ? { 'Content-Disposition': `attachment; filename="ticket-${ticket.ticketId}.html"` }
-          : {};
-        return sendHtml(res, 200, html, headers);
-      }
-
-      if (method === 'GET' && pathname === '/api/tickets/export/all.html') {
-        const tickets = gameStore.getTickets();
-        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
-        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
-        const html = renderAllTicketsHtml(tickets, { activeSessionUrl });
-        const download = urlObj.searchParams.get('download') === '1';
-        const headers = download
-          ? { 'Content-Disposition': 'attachment; filename="all-tickets.html"' }
-          : {};
-        return sendHtml(res, 200, html, headers);
-      }
-
-      if (method === 'GET' && pathname === '/api/tickets/export/zip') {
-        const tickets = gameStore.getTickets();
-        if (tickets.length === 0) {
-          return sendJson(res, 400, { error: 'No tickets generated yet' });
-        }
-        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
-        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
-        const files = tickets.map((t) => {
-          const safeName = (t.playerName || 'player').replace(/[^a-zA-Z0-9_-]+/g, '_');
-          return {
-            name: `${t.ticketId}-${safeName}.html`,
-            content: renderTicketHtml(t, { activeSessionUrl }),
-          };
-        });
-        const zipBuf = buildZip(files);
-        res.writeHead(200, {
-          'Content-Type': 'application/zip',
-          'Content-Disposition': 'attachment; filename="office-game-tickets.zip"',
-          'Content-Length': zipBuf.length,
-        });
-        res.end(zipBuf);
-        return;
-      }
-
-      const ticketDeleteMatch = pathname.match(/^\/api\/tickets\/([^/]+)$/);
-      if (method === 'DELETE' && ticketDeleteMatch) {
-        const ticketId = decodeURIComponent(ticketDeleteMatch[1]);
-        const ok = gameStore.deleteTicket(ticketId);
-        if (!ok) return sendJson(res, 404, { error: 'Ticket not found' });
-        return commitJson(res, 200, { deleted: true });
-      }
-
-      // ----------------- SESSIONS API -----------------
-      if (method === 'GET' && pathname === '/api/sessions') {
-        const sessions = gameStore.getSessions().map((s) => formatSession(s, baseUrl));
-        return sendJson(res, 200, { sessions });
-      }
-
-      if (method === 'POST' && pathname === '/api/sessions') {
-        const body = await readJsonBody(req);
-        const name = String(body.name || '').trim() || `Round ${gameStore.getSessions().length + 1}`;
-        const consumeUsedNumbers = body.consumeUsedNumbers !== false;
-
-        const session = {
-          id: `SES-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
-          name,
-          token: generateSessionToken(),
-          status: 'ACTIVE',
-          consumeUsedNumbers,
-          createdAt: new Date().toISOString(),
-          expiredAt: null,
-        };
-        gameStore.addSession(session);
-        return commitJson(res, 201, {
-          session: formatSession(session, baseUrl),
-        });
-      }
-
-      const sessionExpireMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/expire$/);
-      if (method === 'POST' && sessionExpireMatch) {
-        const id = decodeURIComponent(sessionExpireMatch[1]);
-        const updated = gameStore.updateSession(id, {
-          status: 'EXPIRED',
-          expiredAt: new Date().toISOString(),
-        });
-        if (!updated) return sendJson(res, 404, { error: 'Session not found' });
-        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
-      }
-
-      const sessionReopenMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/reopen$/);
-      if (method === 'POST' && sessionReopenMatch) {
-        const id = decodeURIComponent(sessionReopenMatch[1]);
-        const updated = gameStore.updateSession(id, {
-          status: 'ACTIVE',
-          expiredAt: null,
-        });
-        if (!updated) return sendJson(res, 404, { error: 'Session not found' });
-        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
-      }
-
-      const sessionSubsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/submissions$/);
-      if (method === 'GET' && sessionSubsMatch) {
-        const id = decodeURIComponent(sessionSubsMatch[1]);
-        const session = gameStore.findSessionById(id);
-        if (!session) return sendJson(res, 404, { error: 'Session not found' });
-        return sendJson(res, 200, {
-          session,
-          submissions: gameStore.getSubmissions(id),
-        });
-      }
-
-      const sessionEvalMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/evaluate$/);
-      if (method === 'POST' && sessionEvalMatch) {
-        const id = decodeURIComponent(sessionEvalMatch[1]);
-        const session = gameStore.findSessionById(id);
-        if (!session) return sendJson(res, 404, { error: 'Session not found' });
-        if (session.status !== 'EXPIRED') {
-          return sendJson(res, 400, {
-            error: 'Session is still ACTIVE. Expire / close the session first to evaluate winners.',
-          });
-        }
-
-        const body = await readJsonBody(req);
-        const records = gameStore.getSubmissions(session.id);
-        let result;
-        try {
-          result = evaluateWinners(records, body.mode, {
-            min: body.min,
-            max: body.max,
-          });
-        } catch (evalErr) {
-          return sendJson(res, 400, { error: evalErr.message });
-        }
-
-        const pointsPerWin = Math.max(1, Number(body.pointsPerWin || 1));
-        const saveToLeaderboard = body.saveToLeaderboard !== false;
-        let roundResult = session.roundResult || null;
-
-        if (saveToLeaderboard) {
-          roundResult = {
-            mode: result.mode,
-            winningValue: result.winningValue,
-            range: result.range,
-            pointsPerWin,
-            winnerTicketIds: result.winners.map((w) => w.ticketId),
-            evaluatedAt: new Date().toISOString(),
-          };
-          gameStore.updateSession(session.id, { roundResult });
-        }
-
-        return commitJson(res, 200, {
-          sessionId: session.id,
-          sessionName: session.name,
-          savedToLeaderboard: saveToLeaderboard,
-          roundResult,
-          ...result,
-        });
-      }
-
-      // ----------------- LEADERBOARD API -----------------
-      if (method === 'GET' && pathname === '/api/leaderboard') {
-        return sendJson(res, 200, gameStore.getLeaderboard());
-      }
-
-      if (method === 'GET' && pathname === '/api/export/leaderboard.csv') {
-        const csv = buildLeaderboardCsv(gameStore.getLeaderboard());
-        res.writeHead(200, {
-          'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': 'attachment; filename="final-leaderboard.csv"',
-        });
-        res.end(csv);
-        return;
-      }
-
-      if (method === 'GET' && pathname === '/api/export/leaderboard.xlsx') {
-        const xlsx = buildLeaderboardXlsx(gameStore.getLeaderboard());
-        res.writeHead(200, {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': 'attachment; filename="final-leaderboard.xlsx"',
-          'Content-Length': xlsx.length,
-        });
-        res.end(xlsx);
-        return;
-      }
-
+      // ----------------- PUBLIC HEALTH & ADMIN AUTH API -----------------
       if (method === 'GET' && pathname === '/api/health') {
         return sendJson(res, 200, {
           ok: true,
-          features: ['reset', 'leaderboard', 'exports', 'state'],
+          features: ['auth', 'reset', 'leaderboard', 'exports', 'state'],
           storage: gameStore.getStorageInfo(),
         });
       }
 
-      if (method === 'GET' && pathname === '/api/state') {
+      if (method === 'GET' && pathname === '/api/auth/status') {
+        const configured = isAuthConfigured();
         return sendJson(res, 200, {
           ok: true,
+          configured,
+          needsSetup: !configured,
+          envManaged: Boolean(staticAdminPassword),
+          authenticated: isAdminAuthorized(req),
           storage: gameStore.getStorageInfo(),
-          decadeSets: DECADE_SETS,
-          tickets: gameStore.getTickets(),
-          sessions: gameStore.getSessions().map((s) => formatSession(s, baseUrl)),
-          submissions: gameStore.getSubmissions(),
-          exportFiles: gameStore.exportFiles,
-          leaderboard: gameStore.getLeaderboard(),
         });
       }
 
-      const sessionDeleteMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
-      if (method === 'DELETE' && sessionDeleteMatch) {
-        const id = decodeURIComponent(sessionDeleteMatch[1]);
-        const ok = gameStore.deleteSession(id);
-        if (!ok) return sendJson(res, 404, { error: 'Session not found' });
-        return commitJson(res, 200, { deleted: true });
+      if (method === 'POST' && pathname === '/api/auth/setup') {
+        if (isAuthConfigured()) {
+          return sendJson(res, 403, { error: 'Admin password is already configured.' });
+        }
+        const body = await readJsonBody(req);
+        const password = String(body.password || '');
+        if (password.length < 4 || password.length > 128) {
+          return sendJson(res, 400, { error: 'Admin password must be between 4 and 128 characters.' });
+        }
+        const salt = crypto.randomBytes(16).toString('hex');
+        const passwordHash = crypto.scryptSync(password, salt, 32).toString('hex');
+        const sessionSecret = crypto.randomBytes(32).toString('hex');
+        gameStore.setAuth({ salt, passwordHash, sessionSecret });
+        const cookieVal = createSessionCookieValue();
+        await gameStore.flushRemote();
+        return sendJson(
+          res,
+          201,
+          { ok: true, authenticated: true, configured: true },
+          { 'Set-Cookie': buildAuthCookieHeader(cookieVal, req, 43200) }
+        );
       }
 
-      if (method === 'POST' && pathname === '/api/reset') {
-        gameStore.resetAll();
-        failedAttempts.clear();
-        return commitJson(res, 200, {
-          reset: true,
-          exportFiles: gameStore.exportFiles,
-        });
+      if (method === 'POST' && pathname === '/api/auth/login') {
+        if (!isAuthConfigured()) {
+          return sendJson(res, 400, { error: 'Admin password is not configured yet.', needsSetup: true });
+        }
+        const rateKey = getClientKey(req, 'admin-auth');
+        if (isRateLimited(rateKey)) {
+          return sendJson(res, 429, { error: 'Too many failed login attempts. Please wait a minute and try again.' });
+        }
+        const body = await readJsonBody(req);
+        if (!verifyAdminPassword(body.password)) {
+          recordFailedAttempt(rateKey);
+          return sendJson(res, 401, { error: 'Invalid admin password.' });
+        }
+        const cookieVal = createSessionCookieValue();
+        return sendJson(
+          res,
+          200,
+          { ok: true, authenticated: true },
+          { 'Set-Cookie': buildAuthCookieHeader(cookieVal, req, 43200) }
+        );
       }
 
-      // ----------------- SUBMISSIONS & CSV / EXCEL EXPORTS -----------------
-      if (method === 'GET' && pathname === '/api/submissions') {
-        const sessionId = urlObj.searchParams.get('sessionId') || null;
-        const exportFiles =
-          typeof gameStore.flushExports === 'function'
-            ? gameStore.flushExports()
-            : gameStore.exportFiles;
-        return sendJson(res, 200, {
-          submissions: gameStore.getSubmissions(sessionId),
-          exportFiles,
-        });
+      if (method === 'POST' && pathname === '/api/auth/logout') {
+        return sendJson(
+          res,
+          200,
+          { ok: true, authenticated: false },
+          { 'Set-Cookie': buildAuthCookieHeader('', req, 0) }
+        );
       }
 
-      if (method === 'GET' && pathname === '/api/export/submissions.csv') {
-        const sessionId = urlObj.searchParams.get('sessionId') || null;
-        const rows = gameStore.getSubmissions(sessionId);
-        const csv = buildSubmissionsCsv(rows);
-        const filename = sessionId ? `submissions-${sessionId}.csv` : 'all-submissions.csv';
-        res.writeHead(200, {
-          'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': `attachment; filename="${filename}"`,
-        });
-        res.end(csv);
-        return;
-      }
-
-      if (method === 'GET' && pathname === '/api/export/submissions.xlsx') {
-        const sessionId = urlObj.searchParams.get('sessionId') || null;
-        const rows = gameStore.getSubmissions(sessionId);
-        const xlsx = buildSubmissionsXlsx(rows);
-        const filename = sessionId ? `submissions-${sessionId}.xlsx` : 'all-submissions.xlsx';
-        res.writeHead(200, {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': `attachment; filename="${filename}"`,
-          'Content-Length': xlsx.length,
-        });
-        res.end(xlsx);
-        return;
-      }
-
-      if (method === 'GET' && pathname === '/api/export/tickets.csv') {
-        const csv = buildTicketsCsv(gameStore.getTickets());
-        res.writeHead(200, {
-          'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': 'attachment; filename="tickets.csv"',
-        });
-        res.end(csv);
-        return;
-      }
-
-      if (method === 'GET' && pathname === '/api/export/tickets.xlsx') {
-        const xlsx = buildTicketsXlsx(gameStore.getTickets());
-        res.writeHead(200, {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': 'attachment; filename="tickets.xlsx"',
-          'Content-Length': xlsx.length,
-        });
-        res.end(xlsx);
-        return;
-      }
-
-      // ----------------- PLAYER FORM API -----------------
+      // ----------------- PLAYER FORM API (PUBLIC BY SESSION TOKEN) -----------------
       const playInfoMatch = pathname.match(/^\/api\/play\/([^/]+)$/);
       if (method === 'GET' && playInfoMatch) {
         const token = decodeURIComponent(playInfoMatch[1]);
@@ -739,7 +535,6 @@ function createApp({ store } = {}) {
           });
         }
 
-        // Strict cross-round single-use check: once any number is used by a player, they cannot reuse it in any next round
         const usedNumbers = gameStore.getTicketUsedNumbers(ticket.ticketId);
         if (session.consumeUsedNumbers !== false && usedNumbers.includes(selectedNumber)) {
           return sendJson(res, 400, {
@@ -758,10 +553,465 @@ function createApp({ store } = {}) {
           submittedAt: new Date().toISOString(),
         };
 
-        const nextUsed = [...new Set([...usedNumbers, selectedNumber])];
-        gameStore.recordSubmission(submission, nextUsed);
+        const consumed = session.consumeUsedNumbers !== false ? selectedNumber : null;
+        const atomicRes = await gameStore.recordSubmissionAtomic(submission, consumed);
+        if (atomicRes.duplicate) {
+          return sendJson(res, 409, {
+            error: 'You already submitted a number for this session.',
+            existingSubmission: atomicRes.existing,
+          });
+        }
 
-        return commitJson(res, 201, { submission });
+        return sendJson(res, 201, { submission: atomicRes.submission });
+      }
+
+      // ----------------- ADMIN AUTHENTICATION GATE -----------------
+      if (pathname.startsWith('/api/') && !isAdminAuthorized(req)) {
+        return sendJson(res, 401, {
+          error: 'Admin authentication required',
+          needsSetup: !isAuthConfigured(),
+        });
+      }
+
+      // ----------------- TICKETS API -----------------
+      if (method === 'GET' && pathname === '/api/tickets') {
+        return sendJson(res, 200, {
+          decadeSets: DECADE_SETS,
+          tickets: gameStore.getTickets(),
+        });
+      }
+
+      if (method === 'POST' && pathname === '/api/tickets/generate') {
+        const body = await readJsonBody(req);
+        const rawCount = body.count === undefined ? 1 : Number(body.count);
+        if (!Number.isInteger(rawCount) || rawCount < 1 || rawCount > 1000) {
+          return sendJson(res, 400, { error: 'Ticket count must be an integer between 1 and 1000.' });
+        }
+        const count = rawCount;
+        const numbersPerTicket = Number(body.numbersPerTicket ?? 10);
+        const perSetCheck = body.perSetCheck !== false;
+        const selectedSets = Array.isArray(body.selectedSets)
+          ? body.selectedSets
+          : Array.isArray(body.allowedSets)
+            ? body.allowedSets
+            : null;
+        const excludedNumbers = Array.isArray(body.excludedNumbers) ? body.excludedNumbers : [];
+        const rawPlayerNames = Array.isArray(body.playerNames) ? body.playerNames : [];
+        const trimmedNames = rawPlayerNames.map((n) => String(n ?? '').trim());
+        const nonEmptyNames = trimmedNames.filter(Boolean);
+        if (nonEmptyNames.length > count) {
+          return sendJson(res, 400, {
+            error: `Provided ${nonEmptyNames.length} player name(s) for only ${count} ticket(s). Increase ticket count or remove extra names.`,
+          });
+        }
+        for (const nm of trimmedNames) {
+          if (nm.length > 60) {
+            return sendJson(res, 400, {
+              error: 'Player name cannot exceed 60 characters.',
+            });
+          }
+        }
+        const playerNames = trimmedNames;
+
+        const existingIds = new Set(gameStore.getTickets().map((t) => t.ticketId));
+        const existingCodes = new Set(gameStore.getTickets().map((t) => t.secretCode));
+        let seq = gameStore.state.nextTicketSeq;
+
+        const created = [];
+        for (let i = 0; i < count; i++) {
+          const ticketSeq = seq;
+          const ticketId = generateTicketId(existingIds, ticketSeq);
+          seq += 1;
+          existingIds.add(ticketId);
+
+          const secretCode = generateSecretCode(existingCodes);
+          existingCodes.add(secretCode);
+
+          let numbers;
+          try {
+            numbers = generateTicketNumbers({
+              count: numbersPerTicket,
+              perSetCheck,
+              selectedSets,
+              excludedNumbers,
+            });
+          } catch (genErr) {
+            return sendJson(res, 400, { error: genErr.message });
+          }
+          const check = validateTicketSetDistribution(numbers);
+
+          const rawName = playerNames[i];
+          const playerName =
+            rawName && String(rawName).trim()
+              ? String(rawName).trim()
+              : `Player ${ticketSeq}`;
+
+          created.push({
+            ticketId,
+            playerName,
+            secretCode,
+            numbers,
+            usedNumbers: [],
+            perSetCheck,
+            setValidation: check,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        gameStore.addTickets(created);
+        return commitJson(res, 201, { tickets: created });
+      }
+
+      const ticketReduceMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/reduce$/);
+      if (method === 'PATCH' && ticketReduceMatch) {
+        const ticketId = decodeURIComponent(ticketReduceMatch[1]);
+        const ticket = gameStore.findTicketById(ticketId);
+        if (!ticket) return sendJson(res, 404, { error: 'Ticket not found' });
+
+        const body = await readJsonBody(req);
+        const usedSet = new Set(gameStore.getTicketUsedNumbers(ticket.ticketId));
+        const usedOnTicket = ticket.numbers.filter((n) => usedSet.has(n));
+        const available = ticket.numbers.filter((n) => !usedSet.has(n));
+        const minTarget = Math.max(1, usedOnTicket.length);
+
+        const targetCount = Number(body.targetCount);
+        if (!Number.isInteger(targetCount) || targetCount < minTarget || targetCount >= ticket.numbers.length) {
+          return sendJson(res, 400, {
+            error:
+              usedOnTicket.length > 0 && targetCount < minTarget
+                ? `Cannot shrink ticket below ${usedOnTicket.length} already-used number(s) (minimum total is ${minTarget}).`
+                : `targetCount must be an integer between ${minTarget} and ${ticket.numbers.length - 1}`,
+          });
+        }
+
+        const neededAvailable = targetCount - usedOnTicket.length;
+        if (available.length < neededAvailable) {
+          return sendJson(res, 400, {
+            error: `Ticket only has ${available.length} unused numbers available.`,
+          });
+        }
+
+        const copy = [...available];
+        for (let i = copy.length - 1; i > 0; i--) {
+          const j = crypto.randomInt(0, i + 1);
+          [copy[i], copy[j]] = [copy[j], copy[i]];
+        }
+        const reduced = [...usedOnTicket, ...copy.slice(0, neededAvailable)].sort((a, b) => a - b);
+        const updated = gameStore.updateTicket(ticket.ticketId, {
+          numbers: reduced,
+          usedNumbers: usedOnTicket,
+          setValidation: validateTicketSetDistribution(reduced),
+        });
+        return commitJson(res, 200, { ticket: updated });
+      }
+
+      const ticketHtmlMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/html$/);
+      if (method === 'GET' && ticketHtmlMatch) {
+        const ticketId = decodeURIComponent(ticketHtmlMatch[1]);
+        const ticket = gameStore.findTicketById(ticketId);
+        if (!ticket) return sendJson(res, 404, { error: 'Ticket not found' });
+
+        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
+        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
+        const html = renderTicketHtml(ticket, { activeSessionUrl });
+        const download = urlObj.searchParams.get('download') === '1';
+        const headers = download
+          ? { 'Content-Disposition': `attachment; filename="ticket-${ticket.ticketId}.html"` }
+          : {};
+        return sendHtml(res, 200, html, headers);
+      }
+
+      if (method === 'GET' && pathname === '/api/tickets/export/all.html') {
+        const tickets = gameStore.getTickets();
+        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
+        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
+        const html = renderAllTicketsHtml(tickets, { activeSessionUrl });
+        const download = urlObj.searchParams.get('download') === '1';
+        const headers = download
+          ? { 'Content-Disposition': 'attachment; filename="all-tickets.html"' }
+          : {};
+        return sendHtml(res, 200, html, headers);
+      }
+
+      if (method === 'GET' && pathname === '/api/tickets/export/zip') {
+        const tickets = gameStore.getTickets();
+        if (tickets.length === 0) {
+          return sendJson(res, 400, { error: 'No tickets generated yet' });
+        }
+        const activeSession = gameStore.getSessions().find((s) => s.status === 'ACTIVE');
+        const activeSessionUrl = activeSession ? `${baseUrl}/play/${activeSession.token}` : '';
+        const files = tickets.map((t) => {
+          const safeName = (t.playerName || 'player').replace(/[^a-zA-Z0-9_-]+/g, '_');
+          return {
+            name: `${t.ticketId}-${safeName}.html`,
+            content: renderTicketHtml(t, { activeSessionUrl }),
+          };
+        });
+        const zipBuf = buildZip(files);
+        res.writeHead(200, {
+          'Content-Type': 'application/zip',
+          'Content-Disposition': 'attachment; filename="office-game-tickets.zip"',
+          'Content-Length': zipBuf.length,
+        });
+        res.end(zipBuf);
+        return;
+      }
+
+      const ticketDeleteMatch = pathname.match(/^\/api\/tickets\/([^/]+)$/);
+      if (method === 'DELETE' && ticketDeleteMatch) {
+        const ticketId = decodeURIComponent(ticketDeleteMatch[1]);
+        const ok = gameStore.deleteTicket(ticketId);
+        if (!ok) return sendJson(res, 404, { error: 'Ticket not found' });
+        return commitJson(res, 200, { deleted: true });
+      }
+
+      // ----------------- SESSIONS API -----------------
+      if (method === 'GET' && pathname === '/api/sessions') {
+        const sessions = gameStore.getSessions().map((s) => formatSession(s, baseUrl));
+        return sendJson(res, 200, { sessions });
+      }
+
+      if (method === 'POST' && pathname === '/api/sessions') {
+        const body = await readJsonBody(req);
+        const trimmedSessionName = String(body.name || '').trim();
+        if (trimmedSessionName.length > 100) {
+          return sendJson(res, 400, { error: 'Session name cannot exceed 100 characters.' });
+        }
+        const name = trimmedSessionName || `Round ${gameStore.getSessions().length + 1}`;
+        const consumeUsedNumbers = body.consumeUsedNumbers !== false;
+
+        const session = {
+          id: `SES-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
+          name,
+          token: generateSessionToken(),
+          status: 'ACTIVE',
+          consumeUsedNumbers,
+          createdAt: new Date().toISOString(),
+          expiredAt: null,
+        };
+        gameStore.addSession(session);
+        return commitJson(res, 201, {
+          session: formatSession(session, baseUrl),
+        });
+      }
+
+      const sessionExpireMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/expire$/);
+      if (method === 'POST' && sessionExpireMatch) {
+        const id = decodeURIComponent(sessionExpireMatch[1]);
+        const updated = gameStore.updateSession(id, {
+          status: 'EXPIRED',
+          expiredAt: new Date().toISOString(),
+        });
+        if (!updated) return sendJson(res, 404, { error: 'Session not found' });
+        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
+      }
+
+      const sessionReopenMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/reopen$/);
+      if (method === 'POST' && sessionReopenMatch) {
+        const id = decodeURIComponent(sessionReopenMatch[1]);
+        const existingSession = gameStore.findSessionById(id);
+        if (!existingSession) return sendJson(res, 404, { error: 'Session not found' });
+        if (existingSession.roundResult) {
+          return sendJson(res, 400, {
+            error: 'Scored sessions are locked on the leaderboard and cannot be reopened.',
+          });
+        }
+        const updated = gameStore.updateSession(id, {
+          status: 'ACTIVE',
+          expiredAt: null,
+        });
+        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
+      }
+
+      const sessionSubsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/submissions$/);
+      if (method === 'GET' && sessionSubsMatch) {
+        const id = decodeURIComponent(sessionSubsMatch[1]);
+        const session = gameStore.findSessionById(id);
+        if (!session) return sendJson(res, 404, { error: 'Session not found' });
+        return sendJson(res, 200, {
+          session,
+          submissions: gameStore.getSubmissions(id),
+        });
+      }
+
+      const sessionEvalMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/evaluate$/);
+      if (method === 'POST' && sessionEvalMatch) {
+        const id = decodeURIComponent(sessionEvalMatch[1]);
+        const session = gameStore.findSessionById(id);
+        if (!session) return sendJson(res, 404, { error: 'Session not found' });
+        if (session.status !== 'EXPIRED') {
+          return sendJson(res, 400, {
+            error: 'Session is still ACTIVE. Expire / close the session first to evaluate winners.',
+          });
+        }
+
+        const body = await readJsonBody(req);
+        const rawPoints = body.pointsPerWin === undefined ? 1 : Number(body.pointsPerWin);
+        if (!Number.isFinite(rawPoints) || !Number.isInteger(rawPoints) || rawPoints < 1 || rawPoints > 1000) {
+          return sendJson(res, 400, {
+            error: 'Points per win must be a whole number between 1 and 1000.',
+          });
+        }
+        const pointsPerWin = rawPoints;
+        const saveToLeaderboard = body.saveToLeaderboard !== false;
+
+        if (saveToLeaderboard && session.roundResult && body.confirmOverwrite !== true) {
+          return sendJson(res, 409, {
+            error: 'This session has already been scored and locked. Confirm overwrite to re-score.',
+            alreadyScored: true,
+            existingRoundResult: session.roundResult,
+          });
+        }
+
+        const records = gameStore.getSubmissions(session.id);
+        let result;
+        try {
+          result = evaluateWinners(records, body.mode, {
+            min: body.min,
+            max: body.max,
+          });
+        } catch (evalErr) {
+          return sendJson(res, 400, { error: evalErr.message });
+        }
+
+        let roundResult = session.roundResult || null;
+
+        if (saveToLeaderboard) {
+          roundResult = {
+            mode: result.mode,
+            winningValue: result.winningValue,
+            range: result.range,
+            pointsPerWin,
+            winnerTicketIds: result.winners.map((w) => w.ticketId),
+            evaluatedAt: new Date().toISOString(),
+          };
+          gameStore.updateSession(session.id, { roundResult });
+        }
+
+        return commitJson(res, 200, {
+          sessionId: session.id,
+          sessionName: session.name,
+          savedToLeaderboard: saveToLeaderboard,
+          roundResult,
+          ...result,
+        });
+      }
+
+      // ----------------- LEADERBOARD API -----------------
+      if (method === 'GET' && pathname === '/api/leaderboard') {
+        return sendJson(res, 200, gameStore.getLeaderboard());
+      }
+
+      if (method === 'GET' && pathname === '/api/export/leaderboard.csv') {
+        const csv = buildLeaderboardCsv(gameStore.getLeaderboard());
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="final-leaderboard.csv"',
+        });
+        res.end(csv);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/export/leaderboard.xlsx') {
+        const xlsx = buildLeaderboardXlsx(gameStore.getLeaderboard());
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'Content-Disposition': 'attachment; filename="final-leaderboard.xlsx"',
+          'Content-Length': xlsx.length,
+        });
+        res.end(xlsx);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/state') {
+        return sendJson(res, 200, {
+          ok: true,
+          storage: gameStore.getStorageInfo(),
+          decadeSets: DECADE_SETS,
+          tickets: gameStore.getTickets(),
+          sessions: gameStore.getSessions().map((s) => formatSession(s, baseUrl)),
+          submissions: gameStore.getSubmissions(),
+          exportFiles: gameStore.exportFiles,
+          leaderboard: gameStore.getLeaderboard(),
+        });
+      }
+
+      const sessionDeleteMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
+      if (method === 'DELETE' && sessionDeleteMatch) {
+        const id = decodeURIComponent(sessionDeleteMatch[1]);
+        const ok = gameStore.deleteSession(id);
+        if (!ok) return sendJson(res, 404, { error: 'Session not found' });
+        return commitJson(res, 200, { deleted: true });
+      }
+
+      if (method === 'POST' && pathname === '/api/reset') {
+        gameStore.resetAll();
+        failedAttempts.clear();
+        return commitJson(res, 200, {
+          reset: true,
+          exportFiles: gameStore.exportFiles,
+        });
+      }
+
+      // ----------------- SUBMISSIONS & CSV / EXCEL EXPORTS -----------------
+      if (method === 'GET' && pathname === '/api/submissions') {
+        const sessionId = urlObj.searchParams.get('sessionId') || null;
+        const exportFiles =
+          typeof gameStore.flushExports === 'function'
+            ? gameStore.flushExports()
+            : gameStore.exportFiles;
+        return sendJson(res, 200, {
+          submissions: gameStore.getSubmissions(sessionId),
+          exportFiles,
+        });
+      }
+
+      if (method === 'GET' && pathname === '/api/export/submissions.csv') {
+        const sessionId = urlObj.searchParams.get('sessionId') || null;
+        const rows = gameStore.getSubmissions(sessionId);
+        const csv = buildSubmissionsCsv(rows);
+        const filename = sessionId ? `submissions-${sessionId}.csv` : 'all-submissions.csv';
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+        });
+        res.end(csv);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/export/submissions.xlsx') {
+        const sessionId = urlObj.searchParams.get('sessionId') || null;
+        const rows = gameStore.getSubmissions(sessionId);
+        const xlsx = buildSubmissionsXlsx(rows);
+        const filename = sessionId ? `submissions-${sessionId}.xlsx` : 'all-submissions.xlsx';
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Content-Length': xlsx.length,
+        });
+        res.end(xlsx);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/export/tickets.csv') {
+        const csv = buildTicketsCsv(gameStore.getTickets());
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="tickets.csv"',
+        });
+        res.end(csv);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/export/tickets.xlsx') {
+        const xlsx = buildTicketsXlsx(gameStore.getTickets());
+        res.writeHead(200, {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'Content-Disposition': 'attachment; filename="tickets.xlsx"',
+          'Content-Length': xlsx.length,
+        });
+        res.end(xlsx);
+        return;
       }
 
       return sendJson(res, 404, { error: 'Not Found' });

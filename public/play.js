@@ -1,43 +1,6 @@
 const pathParts = window.location.pathname.split('/').filter(Boolean);
 const sessionToken = pathParts[1] || '';
 
-function lockForDebug() {
-  const overlay = document.getElementById('debug-lock-overlay');
-  const main = document.getElementById('play-main-shell');
-  if (overlay) overlay.classList.add('active');
-  if (main) main.style.display = 'none';
-}
-
-function initAntiDebug() {
-  document.addEventListener('contextmenu', (e) => e.preventDefault());
-
-  document.addEventListener('keydown', (e) => {
-    const key = (e.key || '').toUpperCase();
-    const ctrlOrMeta = e.ctrlKey || e.metaKey;
-    if (
-      key === 'F12' ||
-      (ctrlOrMeta && e.shiftKey && (key === 'I' || key === 'J' || key === 'C')) ||
-      (ctrlOrMeta && e.altKey && (key === 'I' || key === 'J' || key === 'C')) ||
-      (ctrlOrMeta && (key === 'U' || key === 'S'))
-    ) {
-      e.preventDefault();
-      e.stopPropagation();
-      return false;
-    }
-  });
-
-  setInterval(() => {
-    const t0 = performance.now();
-    // eslint-disable-next-line no-debugger
-    debugger;
-    if (performance.now() - t0 > 120) {
-      lockForDebug();
-    }
-  }, 1500);
-}
-
-initAntiDebug();
-
 const playState = {
   secretCode: '',
   ticketId: '',
@@ -77,14 +40,14 @@ async function fetchJson(url, options = {}) {
 
 async function initPlayPage() {
   if (!sessionToken) {
-    showClosed('Missing session token in URL.');
+    showInvalidLink('Missing session token in URL.');
     return;
   }
 
   try {
     const { resp, data } = await fetchJson(`/api/play/${encodeURIComponent(sessionToken)}`);
     if (!resp.ok || !data.valid) {
-      showClosed(data.error || 'Invalid session link.');
+      showInvalidLink(data.error || 'Invalid session link. Please check the link shared by your admin.');
       return;
     }
 
@@ -93,7 +56,7 @@ async function initPlayPage() {
 
     if (!data.active) {
       badge.className = 'pill danger';
-      badge.textContent = 'CLOSED';
+      badge.textContent = 'EXPIRED';
       showClosed('This session has been closed / expired by the admin.');
       return;
     }
@@ -102,8 +65,19 @@ async function initPlayPage() {
     badge.textContent = 'OPEN';
     document.getElementById('verify-form').style.display = 'block';
   } catch (err) {
-    showClosed(err.message || 'Unable to load session.');
+    showInvalidLink(err.message || 'Unable to load session.');
   }
+}
+
+function showInvalidLink(reason) {
+  document.getElementById('session-title').textContent = 'Invalid Session Link';
+  const badge = document.getElementById('session-badge');
+  badge.className = 'pill danger';
+  badge.textContent = 'INVALID';
+  const heading = document.getElementById('closed-heading');
+  if (heading) heading.textContent = 'Session Link Not Found';
+  document.getElementById('closed-reason').textContent = reason;
+  document.getElementById('closed-view').style.display = 'block';
 }
 
 function showClosed(reason) {
@@ -111,6 +85,8 @@ function showClosed(reason) {
   const badge = document.getElementById('session-badge');
   badge.className = 'pill danger';
   badge.textContent = 'EXPIRED';
+  const heading = document.getElementById('closed-heading');
+  if (heading) heading.textContent = 'Session Unavailable';
   document.getElementById('closed-reason').textContent = reason;
   document.getElementById('closed-view').style.display = 'block';
 }

@@ -5,43 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Office Number Game — Submit Your Number</title>
   <link rel="stylesheet" href="/styles.css" />
-  <style>
-    body {
-      -webkit-user-select: none;
-      user-select: none;
-    }
-    input {
-      -webkit-user-select: text;
-      user-select: text;
-    }
-    #debug-lock-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      z-index: 9999;
-      background: rgba(2, 6, 23, 0.96);
-      backdrop-filter: blur(12px);
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      text-align: center;
-    }
-    #debug-lock-overlay.active {
-      display: flex;
-    }
-  </style>
 </head>
 <body>
-  <div id="debug-lock-overlay">
-    <div class="card" style="max-width:440px; border-color: rgba(239, 68, 68, 0.6);">
-      <h2 style="color:#fca5a5;">Debugging Tools Blocked</h2>
-      <p style="color:#cbd5e1; font-size:14px; line-height:1.5;">
-        Developer tools / inspect mode is disabled during an active game session. Close developer tools and reload the page to continue.
-      </p>
-      <button type="button" class="btn btn-primary" onclick="window.location.reload()">Reload Page</button>
-    </div>
-  </div>
-
   <div class="play-shell" id="play-main-shell">
     <div class="card">
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px;">
@@ -57,7 +22,7 @@
       <!-- CLOSED / INVALID STATE -->
       <div id="closed-view" style="display:none;">
         <div class="alert alert-error" style="margin-bottom:0;">
-          <strong>Session Unavailable</strong><br />
+          <strong id="closed-heading">Session Unavailable</strong><br />
           <span id="closed-reason">This session link has expired or been closed by the admin.</span>
         </div>
       </div>

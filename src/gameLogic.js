@@ -44,7 +44,10 @@ function generateTicketNumbers({
 
   if (perSetCheck) {
     let candidateSetIndices = DECADE_SETS.map((s) => s.index);
-    if (Array.isArray(selectedSets) && selectedSets.length > 0) {
+    if (Array.isArray(selectedSets)) {
+      if (selectedSets.length === 0) {
+        throw new Error('Select at least 1 decade set when Range Check is enabled.');
+      }
       candidateSetIndices = [...new Set(selectedSets.map(Number))].filter(
         (idx) => Number.isInteger(idx) && idx >= 0 && idx <= 9
       );
@@ -160,6 +163,26 @@ function generateSessionToken() {
  * mode: 'least' | 'highest' | 'range'
  */
 function evaluateWinners(submissions, mode, { min = null, max = null } = {}) {
+  if (!['least', 'highest', 'range'].includes(mode)) {
+    throw new Error(`Unsupported winner evaluation mode: ${mode}`);
+  }
+
+  let rangeBounds = null;
+  if (mode === 'range') {
+    const minNum = Number(min);
+    const maxNum = Number(max);
+    if (
+      !Number.isInteger(minNum) ||
+      !Number.isInteger(maxNum) ||
+      minNum < 1 ||
+      maxNum > 100 ||
+      minNum > maxNum
+    ) {
+      throw new Error('Range min and max must be integers in 1..100 with min <= max.');
+    }
+    rangeBounds = { min: minNum, max: maxNum };
+  }
+
   const validRows = (submissions || [])
     .map((row) => ({
       ...row,
@@ -172,7 +195,7 @@ function evaluateWinners(submissions, mode, { min = null, max = null } = {}) {
       mode,
       totalSubmissions: 0,
       winningValue: null,
-      range: mode === 'range' ? { min, max } : null,
+      range: rangeBounds,
       winners: [],
     };
   }
@@ -201,31 +224,16 @@ function evaluateWinners(submissions, mode, { min = null, max = null } = {}) {
     };
   }
 
-  if (mode === 'range') {
-    const minNum = Number(min);
-    const maxNum = Number(max);
-    if (
-      !Number.isInteger(minNum) ||
-      !Number.isInteger(maxNum) ||
-      minNum < 1 ||
-      maxNum > 100 ||
-      minNum > maxNum
-    ) {
-      throw new Error('Range min and max must be integers in 1..100 with min <= max.');
-    }
-    const winners = validRows
-      .filter((r) => r.selectedNumber >= minNum && r.selectedNumber <= maxNum)
-      .sort((a, b) => a.selectedNumber - b.selectedNumber);
-    return {
-      mode,
-      totalSubmissions: validRows.length,
-      winningValue: null,
-      range: { min: minNum, max: maxNum },
-      winners,
-    };
-  }
-
-  throw new Error(`Unsupported winner evaluation mode: ${mode}`);
+  const winners = validRows
+    .filter((r) => r.selectedNumber >= rangeBounds.min && r.selectedNumber <= rangeBounds.max)
+    .sort((a, b) => a.selectedNumber - b.selectedNumber);
+  return {
+    mode,
+    totalSubmissions: validRows.length,
+    winningValue: null,
+    range: rangeBounds,
+    winners,
+  };
 }
 
 /**
@@ -238,7 +246,7 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
 
-  // Map players by ticketId (include any ticketId seen in tickets or submissions)
+  // Map active players by ticketId (deleted tickets are excluded from the leaderboard)
   const playerMap = new Map();
   for (const t of tickets) {
     playerMap.set(t.ticketId, {
@@ -251,21 +259,6 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
       remainingNumbersCount: Math.max(0, (t.numbers || []).length - (t.usedNumbers || []).length),
       roundBreakdown: [],
     });
-  }
-
-  for (const sub of submissions) {
-    if (!playerMap.has(sub.ticketId)) {
-      playerMap.set(sub.ticketId, {
-        ticketId: sub.ticketId,
-        playerName: sub.playerName || sub.ticketId,
-        totalWins: 0,
-        totalPoints: 0,
-        roundsPlayed: 0,
-        totalNumberSum: 0,
-        remainingNumbersCount: 0,
-        roundBreakdown: [],
-      });
-    }
   }
 
   const subsBySession = new Map();
@@ -320,7 +313,7 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
     if (b.totalPoints !== a.totalPoints) return b.totalPoints - a.totalPoints;
     if (b.totalWins !== a.totalWins) return b.totalWins - a.totalWins;
     if (b.roundsPlayed !== a.roundsPlayed) return b.roundsPlayed - a.roundsPlayed;
-    return a.playerName.localeCompare(b.playerName);
+    return a.playerName.localeCompare(b.playerName, undefined, { numeric: true, sensitivity: 'base' });
   });
 
   // Standard competition ranking (1, 1, 3) based on totalPoints & totalWins
