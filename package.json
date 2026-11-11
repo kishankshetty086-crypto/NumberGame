@@ -1,7 +1,7 @@
 {
   "name": "office-number-game",
   "version": "1.0.0",
-  "description": "Office Number Game - Ticket distribution (1-100), session token links, Zoho Sheet sync, and winner evaluation",
+  "description": "Office Number Game - Ticket distribution (1-100), session token links, CSV/Excel exports, and winner evaluation",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
