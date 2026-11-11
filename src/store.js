@@ -1,12 +1,39 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { writeStoredExports } = require('./exportData');
 const { computeCombinedLeaderboard } = require('./gameLogic');
 
-const DEFAULT_DATA_DIR = process.env.VERCEL
-  ? path.join('/tmp', 'office-number-game-data')
-  : path.join(__dirname, '..', 'data');
-const DEFAULT_DB_PATH = path.join(DEFAULT_DATA_DIR, 'db.json');
+function isServerlessEnv() {
+  return Boolean(
+    process.env.VERCEL ||
+      process.env.VERCEL_ENV ||
+      process.env.VERCEL_URL ||
+      process.env.AWS_LAMBDA_FUNCTION_NAME ||
+      process.env.LAMBDA_TASK_ROOT
+  );
+}
+
+function getDefaultDbPath() {
+  const dir = isServerlessEnv()
+    ? path.join(os.tmpdir(), 'office-number-game-data')
+    : path.join(__dirname, '..', 'data');
+  return path.join(dir, 'db.json');
+}
+
+function isDirWritable(dirPath) {
+  try {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+    }
+    const probe = path.join(dirPath, `.probe-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(probe, 'ok', 'utf8');
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function createDefaultState() {
   return {
@@ -18,26 +45,42 @@ function createDefaultState() {
 }
 
 class GameStore {
-  constructor(dbPath = DEFAULT_DB_PATH) {
-    this.dbPath = dbPath;
-    this.dir = path.dirname(dbPath);
-    if (!fs.existsSync(this.dir)) {
-      fs.mkdirSync(this.dir, { recursive: true });
+  constructor(dbPath = getDefaultDbPath()) {
+    let targetPath = dbPath;
+    let targetDir = path.dirname(targetPath);
+
+    if (!isDirWritable(targetDir)) {
+      targetDir = path.join(os.tmpdir(), 'office-number-game-data');
+      targetPath = path.join(targetDir, path.basename(dbPath));
+      this.memoryOnly = !isDirWritable(targetDir);
+    } else {
+      this.memoryOnly = false;
     }
+
+    this.dbPath = targetPath;
+    this.dir = targetDir;
     this.state = this._load();
     this.exportFiles = this._writeExports();
   }
 
   _writeExports() {
-    const lb = computeCombinedLeaderboard(
-      this.state.tickets,
-      this.state.sessions,
-      this.state.submissions
-    );
-    return writeStoredExports(this.dir, this.state.submissions, this.state.tickets, lb);
+    if (this.memoryOnly) return null;
+    try {
+      const lb = computeCombinedLeaderboard(
+        this.state.tickets,
+        this.state.sessions,
+        this.state.submissions
+      );
+      return writeStoredExports(this.dir, this.state.submissions, this.state.tickets, lb);
+    } catch {
+      return null;
+    }
   }
 
   _load() {
+    if (this.memoryOnly) {
+      return createDefaultState();
+    }
     if (!fs.existsSync(this.dbPath)) {
       const initial = createDefaultState();
       this._persist(initial);
@@ -59,9 +102,14 @@ class GameStore {
   }
 
   _persist(stateToSave = this.state) {
-    const tmpPath = `${this.dbPath}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(stateToSave, null, 2), 'utf8');
-    fs.renameSync(tmpPath, this.dbPath);
+    if (this.memoryOnly) return;
+    try {
+      const tmpPath = `${this.dbPath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(stateToSave, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.dbPath);
+    } catch {
+      // ignore disk persistence failures in read-only runtimes
+    }
   }
 
   save() {

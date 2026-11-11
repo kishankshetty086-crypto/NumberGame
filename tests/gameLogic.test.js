@@ -406,3 +406,47 @@ test('Full HTTP API workflow: tickets -> session -> secret code submit -> CSV/Ex
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.body', async () => {
+  const prevVercel = process.env.VERCEL;
+  process.env.VERCEL = '1';
+  try {
+    const handler = require('../api/index');
+    const getResp = await invokeApp(handler, 'GET', '/');
+    assert.equal(getResp.status, 200);
+    assert.ok(getResp.text.includes('Office Number Game'));
+
+    // Simulate Vercel pre-parsed req.body on POST /api/sessions
+    const req = Readable.from([]);
+    req.method = 'POST';
+    req.url = '/api/sessions';
+    req.headers = {
+      host: 'number-game-nine-phi.vercel.app',
+      'x-forwarded-proto': 'https,http',
+      'content-type': 'application/json',
+    };
+    req.body = { name: 'Vercel Test Round' };
+
+    const chunks = [];
+    let statusCode = 200;
+    const res = {
+      writeHead(code) {
+        statusCode = code;
+      },
+      end(data) {
+        if (data) chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(String(data)));
+      },
+    };
+    await handler(req, res);
+    assert.equal(statusCode, 201);
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    assert.equal(parsed.session.name, 'Vercel Test Round');
+    assert.ok(parsed.session.playUrl.startsWith('https://number-game-nine-phi.vercel.app/play/'));
+
+    // Clean up test session
+    await invokeApp(handler, 'POST', '/api/reset');
+  } finally {
+    if (prevVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = prevVercel;
+  }
+});

@@ -50,6 +50,19 @@ function sendHtml(res, statusCode, html, extraHeaders = {}) {
 }
 
 function readJsonBody(req) {
+  if (req.body !== undefined) {
+    if (typeof req.body === 'string') {
+      try {
+        return Promise.resolve(JSON.parse(req.body || '{}'));
+      } catch {
+        return Promise.reject(new Error('Invalid JSON request body'));
+      }
+    }
+    return Promise.resolve(req.body || {});
+  }
+  if (req.readableEnded) {
+    return Promise.resolve({});
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalBytes = 0;
@@ -76,14 +89,29 @@ function readJsonBody(req) {
 }
 
 function getBaseUrl(req) {
-  const proto = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const rawProto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+  const proto = rawProto === 'https' ? 'https' : 'http';
+  const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000');
+  const host = rawHost.split(',')[0].trim() || 'localhost:3000';
   return `${proto}://${host}`;
+}
+
+function resolvePublicDir() {
+  const candidates = [
+    path.join(__dirname, '..', 'public'),
+    path.join(process.cwd(), 'public'),
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'index.html'))) {
+      return dir;
+    }
+  }
+  return candidates[0];
 }
 
 function createApp({ store } = {}) {
   const gameStore = store || new GameStore();
-  const publicDir = path.join(__dirname, '..', 'public');
+  const publicDir = resolvePublicDir();
   const failedAttempts = new Map();
 
   function getClientKey(req, token) {
