@@ -2,9 +2,9 @@
   "name": "office-number-game",
   "version": "1.0.0",
   "description": "Office Number Game - Ticket distribution (1-100), session token links, CSV/Excel exports, and winner evaluation",
-  "main": "src/server.js",
+  "main": "api/index.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/gameServer.js",
     "test": "node --test tests/*.test.js"
   }
 }

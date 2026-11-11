@@ -14,7 +14,7 @@ const {
 const { renderTicketHtml, buildZip } = require('../src/ticketHtml');
 const { toCsv, toXlsxBuffer } = require('../src/exportData');
 const { GameStore } = require('../src/store');
-const { createApp } = require('../src/server');
+const { createApp } = require('../src/gameServer');
 
 function invokeApp(app, method, reqPath, bodyObj = null) {
   return new Promise((resolve, reject) => {

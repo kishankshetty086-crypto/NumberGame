@@ -98,7 +98,7 @@ async function checkBackendHealth() {
     if (err.status === 404) {
       const el = document.getElementById('global-toast');
       el.innerHTML =
-        '<div class="alert alert-error"><strong>Server Restart Required:</strong> An older <code>node src/server.js</code> process is still running. Stop it (<code>Ctrl+C</code>) and run <code>node src/server.js</code> again so Clear Cache, Final Leaderboard, and CSV/Excel exports are active.</div>';
+        '<div class="alert alert-error"><strong>Server Restart Required:</strong> An older <code>npm start</code> process is still running. Stop it (<code>Ctrl+C</code>) and run <code>npm start</code> again so Clear Cache, Final Leaderboard, and CSV/Excel exports are active.</div>';
     }
   }
 }
@@ -716,7 +716,7 @@ async function clearAllCache() {
       showToast('All server data, CSV/Excel files, and browser cache cleared! Ready to start fresh.', 'success');
     } else {
       showToast(
-        'Browser cache & all tickets cleared (older server running: restart "node src/server.js" once to also wipe old closed session history).',
+        'Browser cache & all tickets cleared (older server running: restart "npm start" once to also wipe old closed session history).',
         'info'
       );
     }

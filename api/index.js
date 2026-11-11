@@ -3,7 +3,7 @@ let app = null;
 module.exports = async (req, res) => {
   try {
     if (!app) {
-      const { createApp } = require('../src/server');
+      const { createApp } = require('../src/gameServer');
       app = createApp();
     }
     return await app(req, res);
