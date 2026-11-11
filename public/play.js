@@ -26,16 +26,7 @@ function initAntiDebug() {
     }
   });
 
-  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '');
   setInterval(() => {
-    if (!isMobile && window.devicePixelRatio === 1) {
-      const widthGap = window.outerWidth - window.innerWidth;
-      const heightGap = window.outerHeight - window.innerHeight;
-      if (widthGap > 240 || heightGap > 240) {
-        lockForDebug();
-        return;
-      }
-    }
     const t0 = performance.now();
     // eslint-disable-next-line no-debugger
     debugger;
@@ -70,6 +61,20 @@ function decadeLabel(n) {
   return `${idx * 10 + 1}-${(idx + 1) * 10}`;
 }
 
+async function fetchJson(url, options = {}) {
+  const resp = await fetch(url, { cache: 'no-store', ...options });
+  const raw = await resp.text();
+  let data = {};
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { error: `Unexpected server response (${resp.status})` };
+    }
+  }
+  return { resp, data };
+}
+
 async function initPlayPage() {
   if (!sessionToken) {
     showClosed('Missing session token in URL.');
@@ -77,8 +82,7 @@ async function initPlayPage() {
   }
 
   try {
-    const resp = await fetch(`/api/play/${encodeURIComponent(sessionToken)}`);
-    const data = await resp.json();
+    const { resp, data } = await fetchJson(`/api/play/${encodeURIComponent(sessionToken)}`);
     if (!resp.ok || !data.valid) {
       showClosed(data.error || 'Invalid session link.');
       return;
@@ -128,12 +132,11 @@ document.getElementById('verify-form').addEventListener('submit', async (e) => {
   const ticketId = document.getElementById('play-ticket-id').value.trim();
 
   try {
-    const resp = await fetch(`/api/play/${encodeURIComponent(sessionToken)}/verify`, {
+    const { resp, data } = await fetchJson(`/api/play/${encodeURIComponent(sessionToken)}/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ secretCode, ticketId }),
     });
-    const data = await resp.json();
     if (!resp.ok) {
       throw new Error(data.error || 'Verification failed');
     }
@@ -195,7 +198,7 @@ document.getElementById('submit-number-btn').addEventListener('click', async () 
   btn.textContent = 'Submitting...';
 
   try {
-    const resp = await fetch(`/api/play/${encodeURIComponent(sessionToken)}/submit`, {
+    const { resp, data } = await fetchJson(`/api/play/${encodeURIComponent(sessionToken)}/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -204,7 +207,6 @@ document.getElementById('submit-number-btn').addEventListener('click', async () 
         selectedNumber: playState.selectedNumber,
       }),
     });
-    const data = await resp.json();
     if (!resp.ok) {
       throw new Error(data.error || 'Submission failed');
     }

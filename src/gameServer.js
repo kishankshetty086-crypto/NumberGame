@@ -143,6 +143,19 @@ function createApp({ store } = {}) {
     }
   }
 
+  function formatSession(s, baseUrl) {
+    return {
+      ...s,
+      playUrl: `${baseUrl}/play/${s.token}`,
+      submissionCount: gameStore.getSubmissions(s.id).length,
+    };
+  }
+
+  async function commitJson(res, statusCode, payload) {
+    await gameStore.flushRemote();
+    return sendJson(res, statusCode, payload);
+  }
+
   return async function handleRequest(req, res) {
     try {
       const baseUrl = getBaseUrl(req);
@@ -159,6 +172,10 @@ function createApp({ store } = {}) {
         }
       }
       const method = req.method.toUpperCase();
+
+      if (pathname.startsWith('/api/')) {
+        await gameStore.syncFromRemote();
+      }
 
       // Static public files
       if (method === 'GET' && (pathname === '/' || pathname === '/admin')) {
@@ -246,7 +263,7 @@ function createApp({ store } = {}) {
         }
 
         gameStore.addTickets(created);
-        return sendJson(res, 201, { tickets: created });
+        return commitJson(res, 201, { tickets: created });
       }
 
       const ticketReduceMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/reduce$/);
@@ -280,7 +297,7 @@ function createApp({ store } = {}) {
           numbers: reduced,
           setValidation: validateTicketSetDistribution(reduced),
         });
-        return sendJson(res, 200, { ticket: updated });
+        return commitJson(res, 200, { ticket: updated });
       }
 
       const ticketHtmlMatch = pathname.match(/^\/api\/tickets\/([^/]+)\/html$/);
@@ -340,16 +357,12 @@ function createApp({ store } = {}) {
         const ticketId = decodeURIComponent(ticketDeleteMatch[1]);
         const ok = gameStore.deleteTicket(ticketId);
         if (!ok) return sendJson(res, 404, { error: 'Ticket not found' });
-        return sendJson(res, 200, { deleted: true });
+        return commitJson(res, 200, { deleted: true });
       }
 
       // ----------------- SESSIONS API -----------------
       if (method === 'GET' && pathname === '/api/sessions') {
-        const sessions = gameStore.getSessions().map((s) => ({
-          ...s,
-          playUrl: `${baseUrl}/play/${s.token}`,
-          submissionCount: gameStore.getSubmissions(s.id).length,
-        }));
+        const sessions = gameStore.getSessions().map((s) => formatSession(s, baseUrl));
         return sendJson(res, 200, { sessions });
       }
 
@@ -368,12 +381,8 @@ function createApp({ store } = {}) {
           expiredAt: null,
         };
         gameStore.addSession(session);
-        return sendJson(res, 201, {
-          session: {
-            ...session,
-            playUrl: `${baseUrl}/play/${session.token}`,
-            submissionCount: 0,
-          },
+        return commitJson(res, 201, {
+          session: formatSession(session, baseUrl),
         });
       }
 
@@ -385,7 +394,7 @@ function createApp({ store } = {}) {
           expiredAt: new Date().toISOString(),
         });
         if (!updated) return sendJson(res, 404, { error: 'Session not found' });
-        return sendJson(res, 200, { session: updated });
+        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
       }
 
       const sessionReopenMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/reopen$/);
@@ -396,7 +405,7 @@ function createApp({ store } = {}) {
           expiredAt: null,
         });
         if (!updated) return sendJson(res, 404, { error: 'Session not found' });
-        return sendJson(res, 200, { session: updated });
+        return commitJson(res, 200, { session: formatSession(updated, baseUrl) });
       }
 
       const sessionSubsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/submissions$/);
@@ -444,7 +453,7 @@ function createApp({ store } = {}) {
           gameStore.updateSession(session.id, { roundResult });
         }
 
-        return sendJson(res, 200, {
+        return commitJson(res, 200, {
           sessionId: session.id,
           sessionName: session.name,
           savedToLeaderboard: saveToLeaderboard,
@@ -482,7 +491,21 @@ function createApp({ store } = {}) {
       if (method === 'GET' && pathname === '/api/health') {
         return sendJson(res, 200, {
           ok: true,
-          features: ['reset', 'leaderboard', 'exports'],
+          features: ['reset', 'leaderboard', 'exports', 'state'],
+          storage: gameStore.getStorageInfo(),
+        });
+      }
+
+      if (method === 'GET' && pathname === '/api/state') {
+        return sendJson(res, 200, {
+          ok: true,
+          storage: gameStore.getStorageInfo(),
+          decadeSets: DECADE_SETS,
+          tickets: gameStore.getTickets(),
+          sessions: gameStore.getSessions().map((s) => formatSession(s, baseUrl)),
+          submissions: gameStore.getSubmissions(),
+          exportFiles: gameStore.exportFiles,
+          leaderboard: gameStore.getLeaderboard(),
         });
       }
 
@@ -491,13 +514,13 @@ function createApp({ store } = {}) {
         const id = decodeURIComponent(sessionDeleteMatch[1]);
         const ok = gameStore.deleteSession(id);
         if (!ok) return sendJson(res, 404, { error: 'Session not found' });
-        return sendJson(res, 200, { deleted: true });
+        return commitJson(res, 200, { deleted: true });
       }
 
       if (method === 'POST' && pathname === '/api/reset') {
         gameStore.resetAll();
         failedAttempts.clear();
-        return sendJson(res, 200, {
+        return commitJson(res, 200, {
           reset: true,
           exportFiles: gameStore.exportFiles,
         });
@@ -703,7 +726,7 @@ function createApp({ store } = {}) {
         const nextUsed = [...new Set([...usedNumbers, selectedNumber])];
         gameStore.updateTicket(ticket.ticketId, { usedNumbers: nextUsed });
 
-        return sendJson(res, 201, { submission });
+        return commitJson(res, 201, { submission });
       }
 
       return sendJson(res, 404, { error: 'Not Found' });

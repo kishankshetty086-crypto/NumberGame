@@ -103,6 +103,7 @@
       <div class="grid-2">
         <div class="card">
           <h2>Create Session Link</h2>
+          <div id="session-storage-notice"></div>
           <form id="create-session-form">
             <div class="field">
               <label for="session-name">Session / Round Name</label>
@@ -116,7 +117,7 @@
                 <li>Player form blocks browser DevTools / debugging shortcuts.</li>
               </ul>
             </div>
-            <button type="submit" class="btn btn-primary" style="width:100%">
+            <button type="submit" class="btn btn-primary" id="create-session-btn" style="width:100%">
               Generate New Session Token & Link
             </button>
           </form>

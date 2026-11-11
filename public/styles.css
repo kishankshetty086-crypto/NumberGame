@@ -320,6 +320,17 @@ input:focus, select:focus, textarea:focus {
   word-break: break-all;
 }
 
+.session-url-input {
+  flex: 1;
+  min-width: 220px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  padding: 2px 4px;
+  outline: none;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

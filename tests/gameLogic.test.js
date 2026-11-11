@@ -421,6 +421,13 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
     assert.equal(rewrittenHealth.status, 200);
     assert.equal(JSON.parse(rewrittenHealth.text).ok, true);
 
+    const stateResp = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/state');
+    assert.equal(stateResp.status, 200);
+    const stateBody = JSON.parse(stateResp.text);
+    assert.equal(stateBody.ok, true);
+    assert.equal(stateBody.storage.mode, 'tmp-ephemeral');
+    assert.equal(stateBody.storage.persistent, false);
+
     // Simulate Vercel pre-parsed req.body on POST /api/sessions
     const req = Readable.from([]);
     req.method = 'POST';
@@ -453,5 +460,60 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
   } finally {
     if (prevVercel === undefined) delete process.env.VERCEL;
     else process.env.VERCEL = prevVercel;
+  }
+});
+
+test('Remote KV/Redis sync shares session links across separate serverless instances', async () => {
+  const remoteMap = new Map();
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, opts = {}) => {
+    const cmd = JSON.parse(opts.body);
+    if (cmd[0] === 'GET') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { result: remoteMap.get(cmd[1]) ?? null };
+        },
+      };
+    }
+    if (cmd[0] === 'SET') {
+      remoteMap.set(cmd[1], cmd[2]);
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { result: 'OK' };
+        },
+      };
+    }
+    throw new Error(`Unexpected command: ${cmd[0]}`);
+  };
+
+  const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-kv-1-'));
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-kv-2-'));
+  try {
+    const remoteKv = { url: 'https://kv.example.test', token: 'tok', key: 'test_game_state' };
+    const app1 = createApp({ store: new GameStore(path.join(dir1, 'db.json'), { remoteKv }) });
+    const app2 = createApp({ store: new GameStore(path.join(dir2, 'db.json'), { remoteKv }) });
+
+    const created = await invokeApp(app1, 'POST', '/api/sessions', { name: "Kishan's Round 1" });
+    assert.equal(created.status, 201);
+    const token = created.json.session.token;
+
+    // Second completely separate instance must see the created session
+    const playInfo = await invokeApp(app2, 'GET', `/api/play/${token}`);
+    assert.equal(playInfo.status, 200);
+    assert.equal(playInfo.json.valid, true);
+    assert.equal(playInfo.json.session.name, "Kishan's Round 1");
+
+    const stateOnApp2 = await invokeApp(app2, 'GET', '/api/state');
+    assert.equal(stateOnApp2.json.storage.mode, 'redis');
+    assert.equal(stateOnApp2.json.storage.persistent, true);
+    assert.equal(stateOnApp2.json.sessions.length, 1);
+  } finally {
+    globalThis.fetch = prevFetch;
+    fs.rmSync(dir1, { recursive: true, force: true });
+    fs.rmSync(dir2, { recursive: true, force: true });
   }
 });

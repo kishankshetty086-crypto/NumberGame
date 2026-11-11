@@ -5,6 +5,7 @@ const state = {
   submissions: [],
   exportFiles: null,
   leaderboard: null,
+  storage: null,
 };
 
 function esc(str) {
@@ -103,7 +104,55 @@ async function checkBackendHealth() {
   }
 }
 
+function renderStorageNotice() {
+  const noticeEl = document.getElementById('session-storage-notice');
+  if (!noticeEl) return;
+  if (state.storage && state.storage.persistent === false) {
+    noticeEl.innerHTML =
+      '<div class="alert alert-error" style="font-size:12.5px; margin-bottom:12px;">' +
+      '<strong>Temporary Serverless Storage Active:</strong> Vercel <code>/tmp</code> is not shared across separate player connections or cold starts. ' +
+      'To share session links with remote players reliably on Vercel, connect <strong>Upstash Redis / Vercel KV</strong> (<code>UPSTASH_REDIS_REST_URL</code> &amp; <code>UPSTASH_REDIS_REST_TOKEN</code>) in Vercel Project Settings.' +
+      '</div>';
+  } else {
+    noticeEl.innerHTML = '';
+  }
+}
+
+function applyFullState(data) {
+  if (data.storage) state.storage = data.storage;
+  if (data.decadeSets) state.decadeSets = data.decadeSets;
+  if (data.tickets) state.tickets = data.tickets;
+  if (data.sessions) state.sessions = data.sessions;
+  if (data.submissions !== undefined) state.submissions = data.submissions || [];
+  if (data.exportFiles !== undefined) state.exportFiles = data.exportFiles || null;
+  if (data.leaderboard) state.leaderboard = data.leaderboard;
+
+  renderStorageNotice();
+  renderDecadeCheckboxes();
+  renderTickets();
+  document.getElementById('pill-tickets').textContent = `Tickets: ${state.tickets.length}`;
+  document.getElementById('ticket-total').textContent = state.tickets.length;
+
+  const activeCount = state.sessions.filter((s) => s.status === 'ACTIVE').length;
+  document.getElementById('pill-sessions').textContent = `Active Sessions: ${activeCount}`;
+  renderSessions();
+  renderEvalSessionSelect();
+
+  renderSubmissionsPanel();
+  if (state.leaderboard) renderLeaderboard(state.leaderboard);
+  saveBrowserCache();
+}
+
 async function refreshAll() {
+  try {
+    const data = await api('/api/state');
+    applyFullState(data);
+    return;
+  } catch (err) {
+    if (err.status !== 404) {
+      await checkBackendHealth();
+    }
+  }
   await checkBackendHealth();
   await Promise.allSettled([loadTickets(), loadSessions(), loadSubmissions(), loadLeaderboard()]);
   saveBrowserCache();
@@ -171,15 +220,15 @@ function renderTickets() {
               </span>
             </div>
             <div class="btn-row">
-              <button type="button" class="btn btn-secondary btn-sm" onclick="copyString('${esc(t.secretCode)}', 'Secret code copied!')">Copy Code</button>
-              <a class="btn btn-secondary btn-sm" href="/api/tickets/${encodeURIComponent(t.ticketId)}/html" target="_blank">Preview HTML</a>
+              <button type="button" class="btn btn-secondary btn-sm" data-action="copy-code" data-value="${esc(t.secretCode)}">Copy Code</button>
+              <a class="btn btn-secondary btn-sm" href="/api/tickets/${encodeURIComponent(t.ticketId)}/html" target="_blank" rel="noopener">Preview HTML</a>
               <a class="btn btn-primary btn-sm" href="/api/tickets/${encodeURIComponent(t.ticketId)}/html?download=1">Download HTML</a>
               ${
                 t.numbers.length > 1
-                  ? `<button type="button" class="btn btn-secondary btn-sm" onclick="reduceTicket('${esc(t.ticketId)}', ${t.numbers.length})">Reduce</button>`
+                  ? `<button type="button" class="btn btn-secondary btn-sm" data-action="reduce-ticket" data-id="${esc(t.ticketId)}" data-count="${t.numbers.length}">Reduce</button>`
                   : ''
               }
-              <button type="button" class="btn btn-danger btn-sm" onclick="deleteTicket('${esc(t.ticketId)}')">Delete</button>
+              <button type="button" class="btn btn-danger btn-sm" data-action="delete-ticket" data-id="${esc(t.ticketId)}">Delete</button>
             </div>
           </div>
           <div class="num-pills">${pills}</div>
@@ -189,9 +238,48 @@ function renderTickets() {
     .join('');
 }
 
-window.copyString = function (val, msg) {
-  navigator.clipboard.writeText(val).then(() => showToast(msg || 'Copied!', 'success'));
+window.copyString = async function (val, msg) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(val);
+      showToast(msg || 'Copied!', 'success');
+      return;
+    }
+  } catch {
+    // Fall back to execCommand below when Clipboard API is blocked
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = val;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) {
+      showToast(msg || 'Copied!', 'success');
+      return;
+    }
+  } catch {
+    // ignore fallback errors
+  }
+  showToast('Could not auto-copy. Please select the link and press Ctrl+C.', 'info');
 };
+
+document.getElementById('tickets-container').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === 'copy-code') {
+    window.copyString(btn.dataset.value || '', 'Secret code copied!');
+  } else if (action === 'reduce-ticket') {
+    window.reduceTicket(btn.dataset.id, Number(btn.dataset.count));
+  } else if (action === 'delete-ticket') {
+    window.deleteTicket(btn.dataset.id);
+  }
+});
 
 window.reduceTicket = async function (ticketId, currentCount) {
   const input = prompt(`Reduce ticket ${ticketId} from ${currentCount} numbers to how many numbers? (1 - ${currentCount - 1})`, String(currentCount - 1));
@@ -261,22 +349,34 @@ document.getElementById('generate-tickets-form').addEventListener('submit', asyn
         excludedNumbers,
       }),
     });
+    state.tickets.push(...(data.tickets || []));
+    renderTickets();
+    document.getElementById('pill-tickets').textContent = `Tickets: ${state.tickets.length}`;
+    document.getElementById('ticket-total').textContent = state.tickets.length;
+    saveBrowserCache();
     showToast(`Generated ${data.tickets.length} ticket(s) with unique IDs and secret codes.`, 'success');
     document.getElementById('player-names').value = '';
-    await refreshAll();
+    if (!state.storage || state.storage.persistent) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
   }
 });
 
-// Sessions
-async function loadSessions() {
-  const data = await api('/api/sessions');
-  state.sessions = data.sessions;
+function syncSessionsUi() {
   const activeCount = state.sessions.filter((s) => s.status === 'ACTIVE').length;
   document.getElementById('pill-sessions').textContent = `Active Sessions: ${activeCount}`;
   renderSessions();
   renderEvalSessionSelect();
+  saveBrowserCache();
+}
+
+// Sessions
+async function loadSessions() {
+  const data = await api('/api/sessions');
+  state.sessions = data.sessions;
+  syncSessionsUi();
 }
 
 function renderSessions() {
@@ -297,26 +397,26 @@ function renderSessions() {
           <div class="ticket-item-head" style="margin-bottom:6px;">
             <div>
               <strong>${esc(s.name)}</strong>
-              <span class="pill ${isActive ? 'ok' : 'danger'}" style="margin-left:8px;">${s.status}</span>
-              <span class="pill" style="margin-left:4px;">Submissions: ${s.submissionCount}</span>
+              <span class="pill ${isActive ? 'ok' : 'danger'}" style="margin-left:8px;">${esc(s.status)}</span>
+              <span class="pill" style="margin-left:4px;">Submissions: ${s.submissionCount ?? 0}</span>
               ${evalBadge}
             </div>
             <div class="btn-row">
-              <button type="button" class="btn btn-secondary btn-sm" onclick="viewSubmissions('${esc(s.id)}', '${esc(s.name)}')">View Submissions</button>
+              <button type="button" class="btn btn-secondary btn-sm" data-action="view-subs" data-id="${esc(s.id)}" data-name="${esc(s.name)}">View Submissions</button>
               <a class="btn btn-secondary btn-sm" href="/api/export/submissions.csv?sessionId=${encodeURIComponent(s.id)}">CSV</a>
               <a class="btn btn-secondary btn-sm" href="/api/export/submissions.xlsx?sessionId=${encodeURIComponent(s.id)}">Excel</a>
               ${
                 isActive
-                  ? `<button type="button" class="btn btn-danger btn-sm" onclick="expireSession('${esc(s.id)}')">Expire / Close Session</button>`
-                  : `<button type="button" class="btn btn-success btn-sm" onclick="reopenSession('${esc(s.id)}')">Reopen Session</button>`
+                  ? `<button type="button" class="btn btn-danger btn-sm" data-action="expire" data-id="${esc(s.id)}">Expire / Close Session</button>`
+                  : `<button type="button" class="btn btn-success btn-sm" data-action="reopen" data-id="${esc(s.id)}">Reopen Session</button>`
               }
-              <button type="button" class="btn btn-danger btn-sm" onclick="deleteSession('${esc(s.id)}')">Delete</button>
+              <button type="button" class="btn btn-danger btn-sm" data-action="delete" data-id="${esc(s.id)}">Delete</button>
             </div>
           </div>
           <div class="session-link-box">
-            <span class="mono" style="flex:1">${esc(s.playUrl)}</span>
-            <button type="button" class="btn btn-primary btn-sm" onclick="copyString('${esc(s.playUrl)}', 'Session link copied!')">Copy Link</button>
-            <a class="btn btn-secondary btn-sm" href="${esc(s.playUrl)}" target="_blank">Open Form</a>
+            <input type="text" readonly class="mono session-url-input" value="${esc(s.playUrl)}" aria-label="Session Link" />
+            <button type="button" class="btn btn-primary btn-sm" data-action="copy-link" data-url="${esc(s.playUrl)}">Copy Link</button>
+            <a class="btn btn-secondary btn-sm" href="${esc(s.playUrl)}" target="_blank" rel="noopener">Open Form</a>
           </div>
           <div style="font-size:12px; color:var(--muted);">
             Token: <code class="mono">${esc(s.token)}</code> • Single-use numbers enforced across rounds • Created: ${new Date(s.createdAt).toLocaleString()}
@@ -327,19 +427,57 @@ function renderSessions() {
     .join('');
 }
 
+document.getElementById('sessions-container').addEventListener('click', (e) => {
+  if (e.target.classList.contains('session-url-input')) {
+    e.target.select();
+    return;
+  }
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === 'copy-link') {
+    window.copyString(btn.dataset.url || '', 'Session link copied!');
+  } else if (action === 'view-subs') {
+    window.viewSubmissions(btn.dataset.id, btn.dataset.name);
+  } else if (action === 'expire') {
+    window.expireSession(btn.dataset.id);
+  } else if (action === 'reopen') {
+    window.reopenSession(btn.dataset.id);
+  } else if (action === 'delete') {
+    window.deleteSession(btn.dataset.id);
+  }
+});
+
 document.getElementById('create-session-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  const submitBtn = document.getElementById('create-session-btn');
+  const prevLabel = submitBtn ? submitBtn.textContent : '';
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Generating Link...';
+  }
   try {
     const name = document.getElementById('session-name').value.trim();
     const data = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ name, consumeUsedNumbers: true }),
     });
+    if (data.session) {
+      state.sessions = [data.session, ...state.sessions.filter((s) => s.id !== data.session.id)];
+      syncSessionsUi();
+    }
     showToast(`Created session "${data.session.name}" with a new link token!`, 'success');
     document.getElementById('session-name').value = '';
-    await refreshAll();
+    if (!state.storage || state.storage.persistent) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = prevLabel;
+    }
   }
 });
 
@@ -347,9 +485,15 @@ document.getElementById('refresh-sessions-btn').addEventListener('click', refres
 
 window.expireSession = async function (id) {
   try {
-    await api(`/api/sessions/${encodeURIComponent(id)}/expire`, { method: 'POST' });
+    const data = await api(`/api/sessions/${encodeURIComponent(id)}/expire`, { method: 'POST' });
+    if (data.session) {
+      state.sessions = state.sessions.map((s) => (s.id === id ? data.session : s));
+      syncSessionsUi();
+    }
     showToast('Session expired/closed. Players can no longer submit. You can now evaluate winners!', 'success');
-    await refreshAll();
+    if (!state.storage || state.storage.persistent) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -357,9 +501,15 @@ window.expireSession = async function (id) {
 
 window.reopenSession = async function (id) {
   try {
-    await api(`/api/sessions/${encodeURIComponent(id)}/reopen`, { method: 'POST' });
+    const data = await api(`/api/sessions/${encodeURIComponent(id)}/reopen`, { method: 'POST' });
+    if (data.session) {
+      state.sessions = state.sessions.map((s) => (s.id === id ? data.session : s));
+      syncSessionsUi();
+    }
     showToast('Session reopened.', 'info');
-    await refreshAll();
+    if (!state.storage || state.storage.persistent) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -369,8 +519,14 @@ window.deleteSession = async function (id) {
   if (!confirm(`Delete session ${id} and its submissions?`)) return;
   try {
     await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    state.sessions = state.sessions.filter((s) => s.id !== id);
+    state.submissions = state.submissions.filter((sub) => sub.sessionId !== id);
+    syncSessionsUi();
+    renderSubmissionsPanel();
     showToast(`Deleted session ${id}.`, 'success');
-    await refreshAll();
+    if (!state.storage || state.storage.persistent) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -602,12 +758,7 @@ function renderLeaderboard(data) {
 
 document.getElementById('refresh-leaderboard-btn').addEventListener('click', loadLeaderboard);
 
-// Stored Data & Exports
-async function loadSubmissions() {
-  const data = await api('/api/submissions');
-  state.submissions = data.submissions || [];
-  state.exportFiles = data.exportFiles || null;
-
+function renderSubmissionsPanel() {
   document.getElementById('pill-submissions').textContent = `Stored Submissions: ${state.submissions.length}`;
   document.getElementById('all-subs-count').textContent = state.submissions.length;
 
@@ -643,6 +794,14 @@ async function loadSubmissions() {
       )
       .join('');
   }
+}
+
+// Stored Data & Exports
+async function loadSubmissions() {
+  const data = await api('/api/submissions');
+  state.submissions = data.submissions || [];
+  state.exportFiles = data.exportFiles || null;
+  renderSubmissionsPanel();
 }
 
 document.getElementById('refresh-exports-btn').addEventListener('click', loadSubmissions);

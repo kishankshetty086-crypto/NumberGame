@@ -44,8 +44,21 @@ function createDefaultState() {
   };
 }
 
+function getRemoteKvConfig() {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
+  if (url && token) {
+    return {
+      url: url.replace(/\/+$/, ''),
+      token,
+      key: process.env.GAME_STATE_KEY || 'office_number_game:state',
+    };
+  }
+  return null;
+}
+
 class GameStore {
-  constructor(dbPath = getDefaultDbPath()) {
+  constructor(dbPath = getDefaultDbPath(), options = {}) {
     let targetPath = dbPath;
     let targetDir = path.dirname(targetPath);
 
@@ -59,8 +72,62 @@ class GameStore {
 
     this.dbPath = targetPath;
     this.dir = targetDir;
+    this._remoteKv = options.remoteKv !== undefined ? options.remoteKv : getRemoteKvConfig();
+    this._dirty = false;
     this.state = this._load();
     this.exportFiles = this._writeExports();
+  }
+
+  getStorageInfo() {
+    if (this._remoteKv) {
+      return { mode: 'redis', persistent: true };
+    }
+    if (this.memoryOnly) {
+      return { mode: 'memory', persistent: false };
+    }
+    if (isServerlessEnv()) {
+      return { mode: 'tmp-ephemeral', persistent: false };
+    }
+    return { mode: 'file', persistent: true };
+  }
+
+  async _runKvCommand(command) {
+    if (!this._remoteKv || typeof fetch !== 'function') return null;
+    const resp = await fetch(this._remoteKv.url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this._remoteKv.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+    });
+    if (!resp.ok) {
+      throw new Error(`Remote KV request failed (${resp.status})`);
+    }
+    return resp.json();
+  }
+
+  async syncFromRemote() {
+    if (!this._remoteKv) return;
+    const data = await this._runKvCommand(['GET', this._remoteKv.key]);
+    if (data && typeof data.result === 'string' && data.result.trim()) {
+      const parsed = JSON.parse(data.result);
+      this.state = {
+        ...createDefaultState(),
+        ...parsed,
+      };
+    } else {
+      this.state = createDefaultState();
+    }
+    this._dirty = false;
+    this._persist(this.state);
+    this.exportFiles = this._writeExports();
+  }
+
+  async flushRemote() {
+    if (!this._remoteKv || !this._dirty) return;
+    await this._runKvCommand(['SET', this._remoteKv.key, JSON.stringify(this.state)]);
+    this._dirty = false;
   }
 
   _writeExports() {
@@ -113,6 +180,7 @@ class GameStore {
   }
 
   save() {
+    this._dirty = true;
     this._persist(this.state);
     this.exportFiles = this._writeExports();
   }
