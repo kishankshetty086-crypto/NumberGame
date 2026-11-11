@@ -1,3 +1,4 @@
+const zlib = require('zlib');
 const { getDecadeSetIndex, DECADE_SETS } = require('./gameLogic');
 
 function escapeHtml(str) {
@@ -261,6 +262,35 @@ const SHARED_TICKET_CSS = `
   }
 `;
 
+const TICKET_COPY_SCRIPT = `
+  <script>
+    function copyText(text, btn) {
+      function markCopied() {
+        var prev = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(function() { btn.textContent = prev; }, 1400);
+      }
+      function fallbackCopy() {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          if (document.execCommand('copy')) markCopied();
+          document.body.removeChild(ta);
+        } catch (e) {}
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(markCopied).catch(fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
+    }
+  </script>`;
+
 function renderTicketHtml(ticket, options = {}) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -272,17 +302,7 @@ function renderTicketHtml(ticket, options = {}) {
 </head>
 <body>
   ${renderTicketCardMarkup(ticket, options)}
-  <script>
-    function copyText(text, btn) {
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(function() {
-          var prev = btn.textContent;
-          btn.textContent = 'Copied!';
-          setTimeout(function() { btn.textContent = prev; }, 1400);
-        });
-      }
-    }
-  </script>
+  ${TICKET_COPY_SCRIPT}
 </body>
 </html>`;
 }
@@ -299,17 +319,7 @@ function renderAllTicketsHtml(tickets, options = {}) {
 </head>
 <body>
   ${cards}
-  <script>
-    function copyText(text, btn) {
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(function() {
-          var prev = btn.textContent;
-          btn.textContent = 'Copied!';
-          setTimeout(function() { btn.textContent = prev; }, 1400);
-        });
-      }
-    }
-  </script>
+  ${TICKET_COPY_SCRIPT}
 </body>
 </html>`;
 }
@@ -342,37 +352,41 @@ function buildZip(files) {
 
   for (const file of files) {
     const nameBuf = Buffer.from(file.name, 'utf8');
-    const dataBuf = Buffer.isBuffer(file.content)
+    const rawBuf = Buffer.isBuffer(file.content)
       ? file.content
       : Buffer.from(String(file.content), 'utf8');
-    const crc = crc32(dataBuf);
+    const crc = crc32(rawBuf);
+    const compressedBuf = zlib.deflateRawSync(rawBuf);
+    const useDeflate = compressedBuf.length < rawBuf.length;
+    const method = useDeflate ? 8 : 0;
+    const payloadBuf = useDeflate ? compressedBuf : rawBuf;
 
     const localHeader = Buffer.alloc(30);
     localHeader.writeUInt32LE(0x04034b50, 0);
     localHeader.writeUInt16LE(20, 4);
     localHeader.writeUInt16LE(0x0800, 6); // UTF-8
-    localHeader.writeUInt16LE(0, 8); // store
+    localHeader.writeUInt16LE(method, 8);
     localHeader.writeUInt16LE(0, 10);
     localHeader.writeUInt16LE(0, 12);
     localHeader.writeUInt32LE(crc, 14);
-    localHeader.writeUInt32LE(dataBuf.length, 18);
-    localHeader.writeUInt32LE(dataBuf.length, 22);
+    localHeader.writeUInt32LE(payloadBuf.length, 18);
+    localHeader.writeUInt32LE(rawBuf.length, 22);
     localHeader.writeUInt16LE(nameBuf.length, 26);
     localHeader.writeUInt16LE(0, 28);
 
-    localParts.push(localHeader, nameBuf, dataBuf);
+    localParts.push(localHeader, nameBuf, payloadBuf);
 
     const centralHeader = Buffer.alloc(46);
     centralHeader.writeUInt32LE(0x02014b50, 0);
     centralHeader.writeUInt16LE(20, 4);
     centralHeader.writeUInt16LE(20, 6);
     centralHeader.writeUInt16LE(0x0800, 8);
-    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(method, 10);
     centralHeader.writeUInt16LE(0, 12);
     centralHeader.writeUInt16LE(0, 14);
     centralHeader.writeUInt32LE(crc, 16);
-    centralHeader.writeUInt32LE(dataBuf.length, 20);
-    centralHeader.writeUInt32LE(dataBuf.length, 24);
+    centralHeader.writeUInt32LE(payloadBuf.length, 20);
+    centralHeader.writeUInt32LE(rawBuf.length, 24);
     centralHeader.writeUInt16LE(nameBuf.length, 28);
     centralHeader.writeUInt16LE(0, 30);
     centralHeader.writeUInt16LE(0, 32);
@@ -382,16 +396,17 @@ function buildZip(files) {
     centralHeader.writeUInt32LE(offset, 42);
 
     centralParts.push(centralHeader, nameBuf);
-    offset += localHeader.length + nameBuf.length + dataBuf.length;
+    offset += localHeader.length + nameBuf.length + payloadBuf.length;
   }
 
   const centralDirSize = centralParts.reduce((sum, b) => sum + b.length, 0);
+  const entryCount = Math.min(files.length, 0xffff);
   const endRecord = Buffer.alloc(22);
   endRecord.writeUInt32LE(0x06054b50, 0);
   endRecord.writeUInt16LE(0, 4);
   endRecord.writeUInt16LE(0, 6);
-  endRecord.writeUInt16LE(files.length, 8);
-  endRecord.writeUInt16LE(files.length, 10);
+  endRecord.writeUInt16LE(entryCount, 8);
+  endRecord.writeUInt16LE(entryCount, 10);
   endRecord.writeUInt32LE(centralDirSize, 12);
   endRecord.writeUInt32LE(offset, 16);
   endRecord.writeUInt16LE(0, 20);

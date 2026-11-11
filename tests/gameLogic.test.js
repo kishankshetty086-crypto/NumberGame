@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const { Readable } = require('node:stream');
 
 const {
@@ -141,7 +142,23 @@ test('renderTicketHtml, buildZip, toCsv, and toXlsxBuffer produce valid files', 
   assert.equal(xlsx[0], 0x50); // 'P'
   assert.equal(xlsx[1], 0x4b); // 'K'
   assert.ok(xlsx.toString('utf8').includes('xl/worksheets/sheet1.xml'));
-  assert.ok(xlsx.toString('utf8').includes('<v>42</v>'));
+  // Extract and inflate xl/worksheets/sheet1.xml from the ZIP buffer
+  let sheetXml = '';
+  let off = 0;
+  while (off + 30 <= xlsx.length && xlsx.readUInt32LE(off) === 0x04034b50) {
+    const method = xlsx.readUInt16LE(off + 8);
+    const compSize = xlsx.readUInt32LE(off + 18);
+    const nLen = xlsx.readUInt16LE(off + 26);
+    const xLen = xlsx.readUInt16LE(off + 28);
+    const name = xlsx.slice(off + 30, off + 30 + nLen).toString('utf8');
+    const payload = xlsx.slice(off + 30 + nLen + xLen, off + 30 + nLen + xLen + compSize);
+    if (name === 'xl/worksheets/sheet1.xml') {
+      sheetXml = (method === 8 ? zlib.inflateRawSync(payload) : payload).toString('utf8');
+      break;
+    }
+    off += 30 + nLen + xLen + compSize;
+  }
+  assert.ok(sheetXml.includes('<v>42</v>'));
 });
 
 test('Full HTTP API workflow: tickets -> session -> secret code submit -> CSV/Excel storage -> expire -> winners', async () => {

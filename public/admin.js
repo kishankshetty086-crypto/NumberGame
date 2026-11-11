@@ -6,6 +6,7 @@ const state = {
   exportFiles: null,
   leaderboard: null,
   storage: null,
+  ticketDisplayLimit: 100,
 };
 
 function esc(str) {
@@ -199,7 +200,8 @@ function renderTickets() {
     return;
   }
 
-  container.innerHTML = filtered
+  const visible = filtered.slice(0, state.ticketDisplayLimit);
+  const cardsHtml = visible
     .map((t) => {
       const usedSet = new Set(t.usedNumbers || []);
       const pills = t.numbers
@@ -236,6 +238,21 @@ function renderTickets() {
       `;
     })
     .join('');
+
+  const footerHtml =
+    filtered.length > visible.length
+      ? `
+        <div class="ticket-item" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <span style="font-size:13px; color:var(--muted);">Showing ${visible.length} of ${filtered.length} matching tickets (use Search above to filter all tickets).</span>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary btn-sm" data-action="tickets-more">Show +100 More</button>
+            <button type="button" class="btn btn-primary btn-sm" data-action="tickets-all">Show All (${filtered.length})</button>
+          </div>
+        </div>
+      `
+      : '';
+
+  container.innerHTML = cardsHtml + footerHtml;
 }
 
 window.copyString = async function (val, msg) {
@@ -278,6 +295,12 @@ document.getElementById('tickets-container').addEventListener('click', (e) => {
     window.reduceTicket(btn.dataset.id, Number(btn.dataset.count));
   } else if (action === 'delete-ticket') {
     window.deleteTicket(btn.dataset.id);
+  } else if (action === 'tickets-more') {
+    state.ticketDisplayLimit += 100;
+    renderTickets();
+  } else if (action === 'tickets-all') {
+    state.ticketDisplayLimit = Math.max(state.tickets.length, 10000);
+    renderTickets();
   }
 });
 
@@ -286,12 +309,19 @@ window.reduceTicket = async function (ticketId, currentCount) {
   if (!input) return;
   const targetCount = Number(input);
   try {
-    await api(`/api/tickets/${encodeURIComponent(ticketId)}/reduce`, {
+    const data = await api(`/api/tickets/${encodeURIComponent(ticketId)}/reduce`, {
       method: 'PATCH',
       body: JSON.stringify({ targetCount }),
     });
+    if (data.ticket) {
+      const idx = state.tickets.findIndex((t) => t.ticketId === ticketId);
+      if (idx >= 0) state.tickets[idx] = data.ticket;
+      renderTickets();
+      saveBrowserCache();
+    } else if (state.storage?.persistent !== false) {
+      await loadTickets();
+    }
     showToast(`Ticket ${ticketId} reduced to ${targetCount} numbers.`, 'success');
-    await loadTickets();
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -301,14 +331,24 @@ window.deleteTicket = async function (ticketId) {
   if (!confirm(`Delete ticket ${ticketId}?`)) return;
   try {
     await api(`/api/tickets/${encodeURIComponent(ticketId)}`, { method: 'DELETE' });
+    state.tickets = state.tickets.filter((t) => t.ticketId !== ticketId);
+    renderTickets();
+    document.getElementById('pill-tickets').textContent = `Tickets: ${state.tickets.length}`;
+    document.getElementById('ticket-total').textContent = state.tickets.length;
+    saveBrowserCache();
     showToast(`Deleted ticket ${ticketId}.`, 'success');
-    await refreshAll();
+    if (state.storage?.persistent !== false) {
+      await refreshAll();
+    }
   } catch (err) {
     showToast(err.message, 'error');
   }
 };
 
-document.getElementById('ticket-search').addEventListener('input', renderTickets);
+document.getElementById('ticket-search').addEventListener('input', () => {
+  state.ticketDisplayLimit = 100;
+  renderTickets();
+});
 
 document.getElementById('numbers-per-ticket').addEventListener('input', (e) => {
   document.getElementById('num-count-label').textContent = e.target.value;
@@ -598,7 +638,7 @@ async function runWinnerEvaluation(mode, extra = {}) {
     renderWinnerResults(data);
     if (saveToLeaderboard) {
       showToast(`Saved "${data.sessionName}" result to the Final Leaderboard!`, 'success');
-      await Promise.all([loadSessions(), loadLeaderboard(), loadSubmissions()]);
+      await refreshAll();
     }
   } catch (err) {
     showToast(err.message, 'error');
@@ -779,10 +819,16 @@ function renderSubmissionsPanel() {
   if (state.submissions.length === 0) {
     tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No submissions stored yet.</td></tr>';
   } else {
-    tbody.innerHTML = [...state.submissions]
-      .reverse()
-      .map(
-        (sub) => `
+    const MAX_ROWS = 200;
+    const recent = [...state.submissions].reverse().slice(0, MAX_ROWS);
+    const noteRow =
+      state.submissions.length > MAX_ROWS
+        ? `<tr><td colspan="5" style="color:var(--muted); text-align:center;">Showing latest ${MAX_ROWS} of ${state.submissions.length} submissions (CSV/Excel downloads contain all ${state.submissions.length}).</td></tr>`
+        : '';
+    tbody.innerHTML =
+      recent
+        .map(
+          (sub) => `
         <tr>
           <td>${new Date(sub.submittedAt).toLocaleString()}</td>
           <td>${esc(sub.sessionName)}</td>
@@ -791,8 +837,8 @@ function renderSubmissionsPanel() {
           <td><strong style="font-size:15px; color:#a5b4fc;">${sub.selectedNumber}</strong></td>
         </tr>
       `
-      )
-      .join('');
+        )
+        .join('') + noteRow;
   }
 }
 
@@ -848,6 +894,7 @@ async function clearAllCache() {
     state.sessions = [];
     state.submissions = [];
     state.leaderboard = null;
+    state.ticketDisplayLimit = 100;
 
     document.getElementById('generate-tickets-form').reset();
     document.getElementById('create-session-form').reset();

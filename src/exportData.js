@@ -12,11 +12,21 @@ function csvEscape(val) {
 
 function xmlEscape(val) {
   return String(val ?? '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+function sanitizeSheetName(sheetName) {
+  const cleaned = String(sheetName || 'Data')
+    .replace(/[\\/?*\[\]:]/g, ' ')
+    .trim()
+    .slice(0, 31)
+    .trim();
+  return xmlEscape(cleaned || 'Data');
 }
 
 function toCsv(headers, rows) {
@@ -42,7 +52,7 @@ function columnLetters(indexZeroBased) {
  * Builds a standard OOXML .xlsx workbook buffer using inline strings & numeric cells.
  */
 function toXlsxBuffer(sheetName, headers, rows) {
-  const safeSheetName = xmlEscape(String(sheetName || 'Data').slice(0, 31));
+  const safeSheetName = sanitizeSheetName(sheetName);
   const allRows = [headers, ...rows];
 
   const rowsXml = allRows
@@ -54,7 +64,9 @@ function toXlsxBuffer(sheetName, headers, rows) {
           if (typeof cellVal === 'number' && Number.isFinite(cellVal)) {
             return `<c r="${ref}" t="n"><v>${cellVal}</v></c>`;
           }
-          return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(cellVal)}</t></is></c>`;
+          const escaped = xmlEscape(cellVal);
+          const preserve = /^\s|\s$/.test(escaped) ? ' xml:space="preserve"' : '';
+          return `<c r="${ref}" t="inlineStr"><is><t${preserve}>${escaped}</t></is></c>`;
         })
         .join('');
       return `<row r="${rowNum}">${cellsXml}</row>`;

@@ -49,13 +49,19 @@ function sendHtml(res, statusCode, html, extraHeaders = {}) {
   res.end(html);
 }
 
+function httpError(status, message) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
 function readJsonBody(req) {
   if (req.body !== undefined) {
     if (typeof req.body === 'string') {
       try {
         return Promise.resolve(JSON.parse(req.body || '{}'));
       } catch {
-        return Promise.reject(new Error('Invalid JSON request body'));
+        return Promise.reject(httpError(400, 'Invalid JSON request body'));
       }
     }
     return Promise.resolve(req.body || {});
@@ -69,7 +75,7 @@ function readJsonBody(req) {
     req.on('data', (chunk) => {
       totalBytes += chunk.length;
       if (totalBytes > 2 * 1024 * 1024) {
-        reject(new Error('Request body too large'));
+        reject(httpError(413, 'Request body too large'));
         req.destroy();
         return;
       }
@@ -81,7 +87,7 @@ function readJsonBody(req) {
       try {
         resolve(JSON.parse(raw));
       } catch {
-        reject(new Error('Invalid JSON request body'));
+        reject(httpError(400, 'Invalid JSON request body'));
       }
     });
     req.on('error', reject);
@@ -135,6 +141,13 @@ function createApp({ store } = {}) {
 
   function recordFailedAttempt(key) {
     const now = Date.now();
+    if (failedAttempts.size > 500) {
+      for (const [k, v] of failedAttempts.entries()) {
+        if (now - v.windowStart > 60000) {
+          failedAttempts.delete(k);
+        }
+      }
+    }
     const record = failedAttempts.get(key);
     if (!record || now - record.windowStart > 60000) {
       failedAttempts.set(key, { count: 1, windowStart: now });
@@ -217,10 +230,18 @@ function createApp({ store } = {}) {
 
       if (method === 'POST' && pathname === '/api/tickets/generate') {
         const body = await readJsonBody(req);
-        const count = Math.min(Math.max(Number(body.count || 1), 1), 200);
+        const rawCount = body.count === undefined ? 1 : Number(body.count);
+        if (!Number.isInteger(rawCount) || rawCount < 1 || rawCount > 1000) {
+          return sendJson(res, 400, { error: 'Ticket count must be an integer between 1 and 1000.' });
+        }
+        const count = rawCount;
         const numbersPerTicket = Number(body.numbersPerTicket ?? 10);
         const perSetCheck = body.perSetCheck !== false;
-        const selectedSets = Array.isArray(body.selectedSets) ? body.selectedSets : null;
+        const selectedSets = Array.isArray(body.selectedSets)
+          ? body.selectedSets
+          : Array.isArray(body.allowedSets)
+            ? body.allowedSets
+            : null;
         const excludedNumbers = Array.isArray(body.excludedNumbers) ? body.excludedNumbers : [];
         const playerNames = Array.isArray(body.playerNames) ? body.playerNames : [];
 
@@ -230,25 +251,32 @@ function createApp({ store } = {}) {
 
         const created = [];
         for (let i = 0; i < count; i++) {
-          const ticketId = generateTicketId(existingIds, seq++);
+          const ticketSeq = seq;
+          const ticketId = generateTicketId(existingIds, ticketSeq);
+          seq += 1;
           existingIds.add(ticketId);
 
           const secretCode = generateSecretCode(existingCodes);
           existingCodes.add(secretCode);
 
-          const numbers = generateTicketNumbers({
-            count: numbersPerTicket,
-            perSetCheck,
-            selectedSets,
-            excludedNumbers,
-          });
+          let numbers;
+          try {
+            numbers = generateTicketNumbers({
+              count: numbersPerTicket,
+              perSetCheck,
+              selectedSets,
+              excludedNumbers,
+            });
+          } catch (genErr) {
+            return sendJson(res, 400, { error: genErr.message });
+          }
           const check = validateTicketSetDistribution(numbers);
 
           const rawName = playerNames[i];
           const playerName =
             rawName && String(rawName).trim()
               ? String(rawName).trim()
-              : `Player ${gameStore.getTickets().length + i + 1}`;
+              : `Player ${ticketSeq}`;
 
           created.push({
             ticketId,
@@ -432,10 +460,15 @@ function createApp({ store } = {}) {
 
         const body = await readJsonBody(req);
         const records = gameStore.getSubmissions(session.id);
-        const result = evaluateWinners(records, body.mode, {
-          min: body.min,
-          max: body.max,
-        });
+        let result;
+        try {
+          result = evaluateWinners(records, body.mode, {
+            min: body.min,
+            max: body.max,
+          });
+        } catch (evalErr) {
+          return sendJson(res, 400, { error: evalErr.message });
+        }
 
         const pointsPerWin = Math.max(1, Number(body.pointsPerWin || 1));
         const saveToLeaderboard = body.saveToLeaderboard !== false;
@@ -529,9 +562,13 @@ function createApp({ store } = {}) {
       // ----------------- SUBMISSIONS & CSV / EXCEL EXPORTS -----------------
       if (method === 'GET' && pathname === '/api/submissions') {
         const sessionId = urlObj.searchParams.get('sessionId') || null;
+        const exportFiles =
+          typeof gameStore.flushExports === 'function'
+            ? gameStore.flushExports()
+            : gameStore.exportFiles;
         return sendJson(res, 200, {
           submissions: gameStore.getSubmissions(sessionId),
-          exportFiles: gameStore.exportFiles,
+          exportFiles,
         });
       }
 
@@ -704,7 +741,7 @@ function createApp({ store } = {}) {
 
         // Strict cross-round single-use check: once any number is used by a player, they cannot reuse it in any next round
         const usedNumbers = gameStore.getTicketUsedNumbers(ticket.ticketId);
-        if (usedNumbers.includes(selectedNumber)) {
+        if (session.consumeUsedNumbers !== false && usedNumbers.includes(selectedNumber)) {
           return sendJson(res, 400, {
             error: `Number ${selectedNumber} was already used in an earlier round and cannot be reused.`,
           });
@@ -721,17 +758,15 @@ function createApp({ store } = {}) {
           submittedAt: new Date().toISOString(),
         };
 
-        gameStore.addSubmission(submission);
-
         const nextUsed = [...new Set([...usedNumbers, selectedNumber])];
-        gameStore.updateTicket(ticket.ticketId, { usedNumbers: nextUsed });
+        gameStore.recordSubmission(submission, nextUsed);
 
         return commitJson(res, 201, { submission });
       }
 
       return sendJson(res, 404, { error: 'Not Found' });
     } catch (err) {
-      return sendJson(res, 500, { error: err.message || 'Internal Server Error' });
+      return sendJson(res, err.status || 500, { error: err.message || 'Internal Server Error' });
     }
   };
 }

@@ -268,16 +268,19 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
     }
   }
 
+  const subsBySession = new Map();
+  for (const sub of submissions) {
+    if (!subsBySession.has(sub.sessionId)) {
+      subsBySession.set(sub.sessionId, new Map());
+    }
+    subsBySession.get(sub.sessionId).set(sub.ticketId, sub);
+  }
+
   const roundsSummary = chronologicalSessions.map((ses) => {
-    const sesSubs = submissions.filter((s) => s.sessionId === ses.id);
+    const subByTicket = subsBySession.get(ses.id) || new Map();
     const rr = ses.roundResult || null;
     const winnerIds = new Set(rr?.winnerTicketIds || []);
     const pointsPerWin = Number(rr?.pointsPerWin || 1);
-
-    const subByTicket = new Map();
-    for (const s of sesSubs) {
-      subByTicket.set(s.ticketId, s);
-    }
 
     for (const [ticketId, entry] of playerMap.entries()) {
       const sub = subByTicket.get(ticketId);
@@ -307,7 +310,7 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
       sessionId: ses.id,
       sessionName: ses.name,
       status: ses.status,
-      submissionCount: sesSubs.length,
+      submissionCount: subByTicket.size,
       evaluated: Boolean(rr),
       roundResult: rr,
     };

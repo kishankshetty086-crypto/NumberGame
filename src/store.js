@@ -115,6 +115,8 @@ class GameStore {
     this.dir = targetDir;
     this._remoteKv = options.remoteKv !== undefined ? options.remoteKv : getRemoteKvConfig();
     this._pendingKvCommands = [];
+    this._exportTimer = null;
+    this._exportsDirty = false;
     this.state = this._load();
     this.exportFiles = this._writeExports();
   }
@@ -221,7 +223,8 @@ class GameStore {
   }
 
   _writeExports() {
-    if (this.memoryOnly) return null;
+    if (this.memoryOnly || isServerlessEnv() || this._remoteKv) return null;
+    this._exportsDirty = false;
     try {
       const lb = computeCombinedLeaderboard(
         this.state.tickets,
@@ -232,6 +235,30 @@ class GameStore {
     } catch {
       return null;
     }
+  }
+
+  _scheduleExports() {
+    if (this.memoryOnly || isServerlessEnv() || this._remoteKv) return;
+    this._exportsDirty = true;
+    if (this._exportTimer) clearTimeout(this._exportTimer);
+    this._exportTimer = setTimeout(() => {
+      this._exportTimer = null;
+      this.exportFiles = this._writeExports();
+    }, 150);
+    if (typeof this._exportTimer.unref === 'function') {
+      this._exportTimer.unref();
+    }
+  }
+
+  flushExports() {
+    if (this._exportTimer) {
+      clearTimeout(this._exportTimer);
+      this._exportTimer = null;
+    }
+    if (this._exportsDirty || !this.exportFiles) {
+      this.exportFiles = this._writeExports();
+    }
+    return this.exportFiles;
   }
 
   _load() {
@@ -262,16 +289,20 @@ class GameStore {
     if (this.memoryOnly) return;
     try {
       const tmpPath = `${this.dbPath}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify(stateToSave, null, 2), 'utf8');
+      fs.writeFileSync(tmpPath, JSON.stringify(stateToSave), 'utf8');
       fs.renameSync(tmpPath, this.dbPath);
     } catch {
       // ignore disk persistence failures in read-only runtimes
     }
   }
 
-  save() {
+  save({ immediateExports = false } = {}) {
     this._persist(this.state);
-    this.exportFiles = this._writeExports();
+    if (immediateExports) {
+      this.exportFiles = this._writeExports();
+    } else {
+      this._scheduleExports();
+    }
   }
 
   getTickets() {
@@ -366,6 +397,25 @@ class GameStore {
           keys.submissions,
           ...removedSubs.map((sub) => `${sub.sessionId}:${sub.ticketId}`),
         ]);
+        // Recompute usedNumbers for tickets affected by the deleted session
+        const affectedIds = new Set(removedSubs.map((sub) => sub.ticketId.toUpperCase()));
+        const remainingByTicket = new Map();
+        for (const sub of this.state.submissions) {
+          const tid = sub.ticketId.toUpperCase();
+          if (!affectedIds.has(tid)) continue;
+          if (!remainingByTicket.has(tid)) remainingByTicket.set(tid, []);
+          remainingByTicket.get(tid).push(Number(sub.selectedNumber));
+        }
+        const updatedArgs = [];
+        for (const t of this.state.tickets) {
+          const tid = t.ticketId.toUpperCase();
+          if (!affectedIds.has(tid)) continue;
+          t.usedNumbers = [...new Set(remainingByTicket.get(tid) || [])];
+          updatedArgs.push(t.ticketId, JSON.stringify(t));
+        }
+        if (updatedArgs.length > 0) {
+          this._queueKv(['HSET', keys.tickets, ...updatedArgs]);
+        }
       }
       this.save();
       return true;
@@ -394,6 +444,26 @@ class GameStore {
       `${submission.sessionId}:${submission.ticketId}`,
       JSON.stringify(submission),
     ]);
+    this.save();
+    return submission;
+  }
+
+  recordSubmission(submission, nextUsedNumbers = null) {
+    this.state.submissions.push(submission);
+    const keys = this._kvKeys();
+    this._queueKv([
+      'HSET',
+      keys.submissions,
+      `${submission.sessionId}:${submission.ticketId}`,
+      JSON.stringify(submission),
+    ]);
+    if (Array.isArray(nextUsedNumbers)) {
+      const ticket = this.findTicketById(submission.ticketId);
+      if (ticket) {
+        ticket.usedNumbers = nextUsedNumbers;
+        this._queueKv(['HSET', keys.tickets, ticket.ticketId, JSON.stringify(ticket)]);
+      }
+    }
     this.save();
     return submission;
   }
@@ -432,13 +502,17 @@ class GameStore {
         }
       }
     }
+    if (this._exportTimer) {
+      clearTimeout(this._exportTimer);
+      this._exportTimer = null;
+    }
     if (this._remoteKv) {
       const keys = this._kvKeys();
       this._pendingKvCommands = [
         ['DEL', keys.seq, keys.tickets, keys.sessions, keys.submissions, keys.legacy],
       ];
     }
-    this.save();
+    this.save({ immediateExports: true });
     return this.state;
   }
 }
