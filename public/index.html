@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Office Number Game — Admin Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="topbar">
+      <div class="brand">
+        <h1>Office Number Game — Admin Control</h1>
+        <p>1–100 HTML Ticket Distribution, Tokenized Sessions, Final Multi-Round Leaderboard & CSV/Excel Storage</p>
+      </div>
+      <div class="status-pills" id="header-pills">
+        <span class="pill" id="pill-tickets">Tickets: 0</span>
+        <span class="pill" id="pill-sessions">Active Sessions: 0</span>
+        <span class="pill ok" id="pill-submissions">Stored Submissions: 0</span>
+        <button type="button" class="btn btn-danger btn-sm" id="btn-clear-cache-top">Clear Cache / Start Fresh</button>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="tickets">1. Tickets & Distribution (1–100)</button>
+      <button class="tab-btn" data-tab="sessions">2. Session Link Creator</button>
+      <button class="tab-btn" data-tab="winners">3. Round Winner Evaluation</button>
+      <button class="tab-btn" data-tab="leaderboard">4. Final Leaderboard</button>
+      <button class="tab-btn" data-tab="exports">5. Stored Data (CSV / Excel)</button>
+    </nav>
+
+    <div id="global-toast"></div>
+
+    <!-- TAB 1: TICKETS -->
+    <section class="tab-panel active" id="tab-tickets">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Generate HTML Tickets</h2>
+          <form id="generate-tickets-form">
+            <div class="field">
+              <label for="ticket-count">Number of Tickets</label>
+              <input type="number" id="ticket-count" min="1" max="200" value="5" required />
+            </div>
+
+            <div class="field">
+              <label for="player-names">Player Names (optional, 1 per line)</label>
+              <textarea id="player-names" rows="4" placeholder="Alice&#10;Bob&#10;Charlie"></textarea>
+              <small>Leave blank to auto-name Player 1, Player 2, etc.</small>
+            </div>
+
+            <div class="field">
+              <label for="numbers-per-ticket">
+                Numbers per Ticket (Mid-Round Reduction): <strong id="num-count-label">10</strong>
+              </label>
+              <input type="range" id="numbers-per-ticket" min="1" max="10" value="10" style="width:100%" />
+              <small>Default is 10 numbers. Reduce this when new players join after mid-rounds.</small>
+            </div>
+
+            <div class="field">
+              <label class="checkbox-row">
+                <input type="checkbox" id="per-set-check" checked />
+                <span>Range Check: Allot 1 number per set (1–10, 11–20, ..., 91–100)</span>
+              </label>
+            </div>
+
+            <div class="field" id="decade-sets-box">
+              <label>Allowed Decade Sets (useful when reducing numbers)</label>
+              <div class="decade-grid" id="decade-checkboxes"></div>
+              <small>If fewer than 10 numbers are chosen, numbers are drawn from the checked sets.</small>
+            </div>
+
+            <div class="field">
+              <label for="excluded-numbers">Exclude Specific Numbers (optional, comma-separated)</label>
+              <input type="text" id="excluded-numbers" placeholder="e.g. 5, 14, 99" />
+            </div>
+
+            <button type="submit" class="btn btn-primary" style="width:100%">
+              Generate Tickets & Unique Secret Codes
+            </button>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <div>
+              <h2 style="margin:0">Distributed Tickets (<span id="ticket-total">0</span>)</h2>
+            </div>
+            <div class="btn-row">
+              <input type="text" id="ticket-search" placeholder="Search player or Ticket ID..." style="width:200px" />
+              <a class="btn btn-secondary btn-sm" href="/api/tickets/export/all.html" target="_blank">View All HTML</a>
+              <a class="btn btn-success btn-sm" href="/api/tickets/export/zip">Download HTMLs (.zip)</a>
+              <a class="btn btn-secondary btn-sm" href="/api/export/tickets.csv">CSV</a>
+              <a class="btn btn-secondary btn-sm" href="/api/export/tickets.xlsx">Excel (.xlsx)</a>
+            </div>
+          </div>
+          <div id="tickets-container" class="ticket-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: SESSIONS -->
+    <section class="tab-panel" id="tab-sessions">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Create Session Link</h2>
+          <form id="create-session-form">
+            <div class="field">
+              <label for="session-name">Session / Round Name</label>
+              <input type="text" id="session-name" placeholder="e.g. Round 1 - Morning Session" required />
+            </div>
+            <div class="alert alert-info" style="font-size:12.5px;">
+              <strong>Active Game Checks:</strong>
+              <ul style="margin:6px 0 0 18px; padding:0;">
+                <li>Once a player uses a number in a round, it is locked and cannot be reused in later rounds.</li>
+                <li>One submission per ticket per session.</li>
+                <li>Player form blocks browser DevTools / debugging shortcuts.</li>
+              </ul>
+            </div>
+            <button type="submit" class="btn btn-primary" style="width:100%">
+              Generate New Session Token & Link
+            </button>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <h2 style="margin:0">Game Sessions</h2>
+            <button class="btn btn-secondary btn-sm" id="refresh-sessions-btn" type="button">Refresh</button>
+          </div>
+          <div id="sessions-container"></div>
+        </div>
+      </div>
+
+      <div class="card" id="session-submissions-card" style="margin-top:20px; display:none;">
+        <div class="toolbar">
+          <h2 style="margin:0">Submissions for <span id="sub-session-title"></span></h2>
+          <div class="btn-row">
+            <a class="btn btn-secondary btn-sm" id="sub-export-csv" href="#">Download CSV</a>
+            <a class="btn btn-success btn-sm" id="sub-export-xlsx" href="#">Download Excel (.xlsx)</a>
+            <button class="btn btn-secondary btn-sm" id="close-subs-btn" type="button">Close</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Ticket ID</th>
+                <th>Player</th>
+                <th>Selected Number</th>
+              </tr>
+            </thead>
+            <tbody id="session-submissions-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: ROUND WINNER EVALUATION -->
+    <section class="tab-panel" id="tab-winners">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Evaluate Round Winners (Closed Session)</h2>
+          <div class="field">
+            <label for="eval-session-select">Select Session</label>
+            <select id="eval-session-select"></select>
+            <small>Session must be expired/closed before evaluating winners.</small>
+          </div>
+
+          <div class="field">
+            <label for="eval-points">Points per Round Winner</label>
+            <input type="number" id="eval-points" min="1" max="100" value="1" />
+          </div>
+
+          <div class="field">
+            <label class="checkbox-row">
+              <input type="checkbox" id="save-to-leaderboard" checked />
+              <span>Save result to Final Combined Leaderboard</span>
+            </label>
+          </div>
+
+          <div class="field">
+            <label>Winner Rule</label>
+            <div class="btn-row" style="margin-top:6px;">
+              <button type="button" class="btn btn-primary" id="btn-eval-least">Least Number</button>
+              <button type="button" class="btn btn-primary" id="btn-eval-highest">Highest Number</button>
+            </div>
+          </div>
+
+          <div class="card" style="background:#0f172a; padding:14px; margin-top:14px;">
+            <h3>Specific Range Search</h3>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+              <div class="field" style="margin-bottom:8px;">
+                <label for="range-min">Min (1–100)</label>
+                <input type="number" id="range-min" min="1" max="100" value="1" />
+              </div>
+              <div class="field" style="margin-bottom:8px;">
+                <label for="range-max">Max (1–100)</label>
+                <input type="number" id="range-max" min="1" max="100" value="25" />
+              </div>
+            </div>
+            <button type="button" class="btn btn-success" id="btn-eval-range" style="width:100%">
+              Fetch Winners in Range
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Round Winner Results</h2>
+          <div id="winner-results">
+            <p style="color:var(--muted)">Select a closed session and choose Least Number, Highest Number, or a Specific Range.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: FINAL COMBINED LEADERBOARD -->
+    <section class="tab-panel" id="tab-leaderboard">
+      <div class="card" style="margin-bottom:20px;">
+        <div class="toolbar">
+          <div>
+            <h2 style="margin:0">Combined Multi-Round Final Leaderboard</h2>
+            <p style="margin:4px 0 0; color:var(--muted); font-size:13px;">
+              Aggregates wins and points across all evaluated round sessions.
+            </p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary btn-sm" id="refresh-leaderboard-btn">Refresh</button>
+            <a class="btn btn-primary btn-sm" href="/api/export/leaderboard.csv">Download Leaderboard (.csv)</a>
+            <a class="btn btn-success btn-sm" href="/api/export/leaderboard.xlsx">Download Leaderboard (.xlsx)</a>
+          </div>
+        </div>
+
+        <div id="grand-winner-box"></div>
+        <div id="leaderboard-rounds-summary" class="btn-row" style="margin-bottom:14px;"></div>
+
+        <div style="overflow-x:auto;">
+          <table>
+            <thead id="leaderboard-thead"></thead>
+            <tbody id="leaderboard-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: STORED DATA & EXPORTS -->
+    <section class="tab-panel" id="tab-exports">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Download CSV & Excel Files</h2>
+          <p style="color:var(--muted); font-size:13.5px; margin-top:0;">
+            Every submission, ticket, and leaderboard update is automatically persisted locally to CSV and Excel (<code>.xlsx</code>) files on disk, and can also be downloaded anytime below.
+          </p>
+
+          <div class="field">
+            <label>All Submissions</label>
+            <div class="btn-row">
+              <a class="btn btn-primary" href="/api/export/submissions.csv">Download Submissions (.csv)</a>
+              <a class="btn btn-success" href="/api/export/submissions.xlsx">Download Submissions (.xlsx)</a>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Final Combined Leaderboard</label>
+            <div class="btn-row">
+              <a class="btn btn-primary" href="/api/export/leaderboard.csv">Download Leaderboard (.csv)</a>
+              <a class="btn btn-success" href="/api/export/leaderboard.xlsx">Download Leaderboard (.xlsx)</a>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>All Distributed Tickets</label>
+            <div class="btn-row">
+              <a class="btn btn-secondary" href="/api/export/tickets.csv">Download Tickets (.csv)</a>
+              <a class="btn btn-secondary" href="/api/export/tickets.xlsx">Download Tickets (.xlsx)</a>
+            </div>
+          </div>
+
+          <div class="field" style="margin-top:16px;">
+            <label>Auto-Saved Files on Disk & Browser Cache</label>
+            <div id="browser-cache-status" class="alert alert-info" style="font-size:12px; margin-bottom:8px;">Browser Cache: Checking...</div>
+            <div id="stored-paths-box" class="alert alert-info" style="font-size:12px; margin-bottom:0;"></div>
+          </div>
+
+          <div class="card" style="background:#0f172a; border-color:rgba(239, 68, 68, 0.45); margin-top:16px; padding:14px;">
+            <h3 style="color:#fca5a5;">Clear Cache & Start From Scratch</h3>
+            <p style="font-size:12.5px; color:var(--muted); margin:0 0 10px;">
+              Clears all generated tickets, sessions, submissions, leaderboard results, and resets stored CSV/Excel files.
+            </p>
+            <button type="button" class="btn btn-danger" id="btn-clear-cache-tab" style="width:100%;">
+              Clear All Cache & Reset Game Data
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <h2 style="margin:0">All Stored Submissions (<span id="all-subs-count">0</span>)</h2>
+            <button type="button" class="btn btn-secondary btn-sm" id="refresh-exports-btn">Refresh</button>
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Session</th>
+                  <th>Ticket ID</th>
+                  <th>Player</th>
+                  <th>Number</th>
+                </tr>
+              </thead>
+              <tbody id="all-submissions-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/admin.js"></script>
+</body>
+</html>

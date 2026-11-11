@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Office Number Game — Submit Your Number</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    body {
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    input {
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    #debug-lock-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(2, 6, 23, 0.96);
+      backdrop-filter: blur(12px);
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+    }
+    #debug-lock-overlay.active {
+      display: flex;
+    }
+  </style>
+</head>
+<body>
+  <div id="debug-lock-overlay">
+    <div class="card" style="max-width:440px; border-color: rgba(239, 68, 68, 0.6);">
+      <h2 style="color:#fca5a5;">Debugging Tools Blocked</h2>
+      <p style="color:#cbd5e1; font-size:14px; line-height:1.5;">
+        Developer tools / inspect mode is disabled during an active game session. Close developer tools and reload the page to continue.
+      </p>
+      <button type="button" class="btn btn-primary" onclick="window.location.reload()">Reload Page</button>
+    </div>
+  </div>
+
+  <div class="play-shell" id="play-main-shell">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px;">
+        <div>
+          <div style="font-size:11px; font-weight:800; letter-spacing:0.1em; color:#a5b4fc;">OFFICE NUMBER GAME</div>
+          <h1 style="margin:2px 0 0; font-size:22px;" id="session-title">Loading session...</h1>
+        </div>
+        <span class="pill" id="session-badge">Checking</span>
+      </div>
+
+      <div id="play-alert"></div>
+
+      <!-- CLOSED / INVALID STATE -->
+      <div id="closed-view" style="display:none;">
+        <div class="alert alert-error" style="margin-bottom:0;">
+          <strong>Session Unavailable</strong><br />
+          <span id="closed-reason">This session link has expired or been closed by the admin.</span>
+        </div>
+      </div>
+
+      <!-- STEP 1: ENTER SECRET CODE -->
+      <form id="verify-form" style="display:none;">
+        <div class="field">
+          <label for="play-secret">Secret Code (from your HTML ticket)</label>
+          <input type="text" id="play-secret" class="mono" placeholder="e.g. A7K9M3" autocomplete="off" required />
+        </div>
+        <div class="field">
+          <label for="play-ticket-id">Ticket ID (optional if Secret Code is entered)</label>
+          <input type="text" id="play-ticket-id" class="mono" placeholder="e.g. TKT-001-XXXX" autocomplete="off" />
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:100%">
+          Unlock My Allotted Numbers
+        </button>
+      </form>
+
+      <!-- STEP 2: PICK 1 NUMBER -->
+      <div id="pick-view" style="display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; background:#0f172a; padding:12px 14px; border-radius:10px; border:1px solid var(--border);">
+          <div>
+            <div style="font-size:11px; color:var(--muted);">PLAYER</div>
+            <strong id="verified-player"></strong>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-size:11px; color:var(--muted);">TICKET ID</div>
+            <strong class="mono" id="verified-ticket-id"></strong>
+          </div>
+        </div>
+
+        <p style="font-size:13.5px; color:#cbd5e1; margin:16px 0 6px;">
+          Select <strong>1 number</strong> from your allotted numbers below (each number can only be used once across all rounds):
+        </p>
+
+        <div class="select-grid" id="number-tiles"></div>
+
+        <div class="btn-row">
+          <button type="button" class="btn btn-primary" id="submit-number-btn" style="flex:1" disabled>
+            Submit Selected Number
+          </button>
+          <button type="button" class="btn btn-secondary" id="switch-ticket-btn">
+            Change Ticket
+          </button>
+        </div>
+      </div>
+
+      <!-- STEP 3: RECEIPT -->
+      <div id="receipt-view" style="display:none;">
+        <div class="alert alert-success">
+          <strong>Number Submitted!</strong>
+        </div>
+        <div style="background:#0f172a; border:1px solid var(--border); border-radius:12px; padding:18px; text-align:center;">
+          <div style="font-size:12px; color:var(--muted);">YOUR SUBMITTED NUMBER</div>
+          <div style="font-size:46px; font-weight:800; color:#34d399; line-height:1.2;" id="receipt-number"></div>
+          <div style="margin-top:8px; font-size:14px;" id="receipt-meta"></div>
+          <div style="margin-top:10px;" id="receipt-zoho"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/play.js"></script>
+</body>
+</html>
