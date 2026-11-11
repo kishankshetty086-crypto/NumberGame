@@ -416,6 +416,11 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
     assert.equal(getResp.status, 200);
     assert.ok(getResp.text.includes('Office Number Game'));
 
+    // Verify Vercel rewrite preserving path via __route query parameter
+    const rewrittenHealth = await invokeApp(handler, 'GET', '/api/index.js?__route=/api/health');
+    assert.equal(rewrittenHealth.status, 200);
+    assert.equal(JSON.parse(rewrittenHealth.text).ok, true);
+
     // Simulate Vercel pre-parsed req.body on POST /api/sessions
     const req = Readable.from([]);
     req.method = 'POST';

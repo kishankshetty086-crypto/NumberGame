@@ -147,7 +147,17 @@ function createApp({ store } = {}) {
     try {
       const baseUrl = getBaseUrl(req);
       const urlObj = new URL(req.url, baseUrl);
-      const pathname = urlObj.pathname;
+      let pathname = urlObj.pathname;
+      if ((pathname === '/api/index.js' || pathname === '/api') && urlObj.searchParams.has('__route')) {
+        const rewritten = urlObj.searchParams
+          .getAll('__route')
+          .filter(Boolean)
+          .join('/')
+          .replace(/^\/+/, '');
+        if (rewritten) {
+          pathname = `/${rewritten}`;
+        }
+      }
       const method = req.method.toUpperCase();
 
       // Static public files
