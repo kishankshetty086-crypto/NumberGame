@@ -13,7 +13,7 @@ const {
 } = require('../src/gameLogic');
 const { renderTicketHtml, buildZip } = require('../src/ticketHtml');
 const { toCsv, toXlsxBuffer } = require('../src/exportData');
-const { GameStore } = require('../src/store');
+const { GameStore, getRemoteKvConfig } = require('../src/store');
 const { createApp } = require('../src/gameServer');
 
 function invokeApp(app, method, reqPath, bodyObj = null) {
@@ -463,32 +463,72 @@ test('Vercel serverless handler (api/index.js) serves GET / and pre-parsed req.b
   }
 });
 
-test('Remote KV/Redis sync shares session links across separate serverless instances', async () => {
-  const remoteMap = new Map();
+test('Remote KV/Redis pipeline shares sessions and concurrent submissions across instances', async () => {
+  const strings = new Map();
+  const hashes = new Map();
   const prevFetch = globalThis.fetch;
-  globalThis.fetch = async (_url, opts = {}) => {
-    const cmd = JSON.parse(opts.body);
-    if (cmd[0] === 'GET') {
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { result: remoteMap.get(cmd[1]) ?? null };
-        },
-      };
+
+  function execCmd(cmd) {
+    const op = cmd[0];
+    const key = cmd[1];
+    if (op === 'GET') return { result: strings.get(key) ?? null };
+    if (op === 'SET') {
+      strings.set(key, cmd[2]);
+      return { result: 'OK' };
     }
-    if (cmd[0] === 'SET') {
-      remoteMap.set(cmd[1], cmd[2]);
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { result: 'OK' };
-        },
-      };
+    if (op === 'HSET') {
+      if (!hashes.has(key)) hashes.set(key, new Map());
+      const map = hashes.get(key);
+      for (let i = 2; i < cmd.length; i += 2) {
+        map.set(cmd[i], cmd[i + 1]);
+      }
+      return { result: 1 };
     }
-    throw new Error(`Unexpected command: ${cmd[0]}`);
+    if (op === 'HDEL') {
+      const map = hashes.get(key);
+      let count = 0;
+      if (map) {
+        for (let i = 2; i < cmd.length; i++) {
+          if (map.delete(cmd[i])) count++;
+        }
+      }
+      return { result: count };
+    }
+    if (op === 'HGETALL') {
+      const map = hashes.get(key);
+      if (!map) return { result: [] };
+      const out = [];
+      for (const [f, v] of map.entries()) out.push(f, v);
+      return { result: out };
+    }
+    if (op === 'DEL') {
+      for (let i = 1; i < cmd.length; i++) {
+        strings.delete(cmd[i]);
+        hashes.delete(cmd[i]);
+      }
+      return { result: 1 };
+    }
+    throw new Error(`Unexpected command: ${op}`);
+  }
+
+  globalThis.fetch = async (url, opts = {}) => {
+    assert.ok(String(url).endsWith('/pipeline'));
+    const cmds = JSON.parse(opts.body);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return cmds.map(execCmd);
+      },
+    };
   };
+
+  const prefixedCfg = getRemoteKvConfig({
+    GAME_KV_REST_API_URL: 'https://prefixed.upstash.io/',
+    GAME_KV_REST_API_TOKEN: 'secret-tok',
+  });
+  assert.equal(prefixedCfg.url, 'https://prefixed.upstash.io');
+  assert.equal(prefixedCfg.token, 'secret-tok');
 
   const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-kv-1-'));
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-kv-2-'));
@@ -497,20 +537,42 @@ test('Remote KV/Redis sync shares session links across separate serverless insta
     const app1 = createApp({ store: new GameStore(path.join(dir1, 'db.json'), { remoteKv }) });
     const app2 = createApp({ store: new GameStore(path.join(dir2, 'db.json'), { remoteKv }) });
 
+    const tickets = await invokeApp(app1, 'POST', '/api/tickets/generate', {
+      count: 2,
+      playerNames: ['Alice', 'Bob'],
+    });
+    assert.equal(tickets.status, 201);
+
     const created = await invokeApp(app1, 'POST', '/api/sessions', { name: "Kishan's Round 1" });
     assert.equal(created.status, 201);
     const token = created.json.session.token;
 
-    // Second completely separate instance must see the created session
+    // Second completely separate instance must see both tickets and the created session
     const playInfo = await invokeApp(app2, 'GET', `/api/play/${token}`);
     assert.equal(playInfo.status, 200);
     assert.equal(playInfo.json.valid, true);
     assert.equal(playInfo.json.session.name, "Kishan's Round 1");
 
-    const stateOnApp2 = await invokeApp(app2, 'GET', '/api/state');
-    assert.equal(stateOnApp2.json.storage.mode, 'redis');
-    assert.equal(stateOnApp2.json.storage.persistent, true);
-    assert.equal(stateOnApp2.json.sessions.length, 1);
+    // Two players submit across two different instances without overwriting each other
+    const [t1, t2] = tickets.json.tickets;
+    const sub1 = await invokeApp(app1, 'POST', `/api/play/${token}/submit`, {
+      ticketId: t1.ticketId,
+      secretCode: t1.secretCode,
+      selectedNumber: t1.numbers[0],
+    });
+    const sub2 = await invokeApp(app2, 'POST', `/api/play/${token}/submit`, {
+      ticketId: t2.ticketId,
+      secretCode: t2.secretCode,
+      selectedNumber: t2.numbers[0],
+    });
+    assert.equal(sub1.status, 201);
+    assert.equal(sub2.status, 201);
+
+    const stateOnApp1 = await invokeApp(app1, 'GET', '/api/state');
+    assert.equal(stateOnApp1.json.storage.mode, 'redis');
+    assert.equal(stateOnApp1.json.storage.persistent, true);
+    assert.equal(stateOnApp1.json.sessions.length, 1);
+    assert.equal(stateOnApp1.json.submissions.length, 2);
   } finally {
     globalThis.fetch = prevFetch;
     fs.rmSync(dir1, { recursive: true, force: true });
