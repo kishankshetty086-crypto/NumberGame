@@ -14,7 +14,7 @@ const {
 } = require('../src/gameLogic');
 const { renderTicketHtml, buildZip } = require('../src/ticketHtml');
 const { toCsv, toXlsxBuffer } = require('../src/exportData');
-const { GameStore, getRemoteKvConfig } = require('../src/store');
+const { GameStore, getRemoteKvConfig, getRemotePgConfig } = require('../src/store');
 const { createApp } = require('../src/gameServer');
 
 function invokeApp(app, method, reqPath, bodyObj = null, extraHeaders = {}) {
@@ -630,6 +630,214 @@ test('Remote KV/Redis pipeline shares sessions and concurrent submissions across
     assert.equal(stateOnApp1.json.submissions.length, 2);
   } finally {
     globalThis.fetch = prevFetch;
+    fs.rmSync(dir1, { recursive: true, force: true });
+    fs.rmSync(dir2, { recursive: true, force: true });
+  }
+});
+
+test('Multi-instance Postgres mode preserves shared state and enforces atomic double-submit', async () => {
+  const pgCfg = getRemotePgConfig({
+    POSTGRES_URL: 'postgres://user:pass@db.supabase.co:6543/postgres?sslmode=require',
+  });
+  assert.ok(pgCfg && pgCfg.url.includes('db.supabase.co'));
+
+  const tables = {
+    meta: new Map(),
+    tickets: new Map(),
+    sessions: new Map(),
+    submissions: new Map(),
+  };
+
+  function createFakePgPool() {
+    const query = async (sql, params = []) => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('BEGIN') || normalized.startsWith('COMMIT') || normalized.startsWith('ROLLBACK')) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (normalized.includes('CREATE TABLE IF NOT EXISTS')) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (normalized.startsWith('SELECT key, value FROM ng_meta')) {
+        const rows = [];
+        for (const [k, v] of tables.meta.entries()) {
+          if (k === 'seq' || k === 'auth') rows.push({ key: k, value: v });
+        }
+        return { rows, rowCount: rows.length };
+      }
+      if (normalized.startsWith('SELECT data FROM ng_tickets')) {
+        const rows = [...tables.tickets.values()]
+          .sort((a, b) => a.position - b.position || a.ticketId.localeCompare(b.ticketId))
+          .map((r) => ({ data: r.data }));
+        return { rows, rowCount: rows.length };
+      }
+      if (normalized.startsWith('SELECT data FROM ng_sessions')) {
+        const rows = [...tables.sessions.values()]
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+          .map((r) => ({ data: r.data }));
+        return { rows, rowCount: rows.length };
+      }
+      if (normalized.startsWith('SELECT data FROM ng_submissions')) {
+        const rows = [...tables.submissions.values()]
+          .sort((a, b) => new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime())
+          .map((r) => ({ data: r.data }));
+        return { rows, rowCount: rows.length };
+      }
+      if (normalized.startsWith("INSERT INTO ng_meta (key, value) VALUES ('auth'")) {
+        tables.meta.set('auth', JSON.parse(params[0]));
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith("INSERT INTO ng_meta (key, value) VALUES ('seq'")) {
+        tables.meta.set('seq', JSON.parse(params[0]));
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.includes('INSERT INTO ng_tickets (ticket_id, position, data) SELECT * FROM UNNEST')) {
+        const [ids, positions, payloads] = params;
+        for (let i = 0; i < ids.length; i += 1) {
+          tables.tickets.set(ids[i], {
+            ticketId: ids[i],
+            position: Number(positions[i]),
+            data: JSON.parse(payloads[i]),
+          });
+        }
+        return { rows: [], rowCount: ids.length };
+      }
+      if (normalized.startsWith('INSERT INTO ng_tickets (ticket_id, position, data) VALUES')) {
+        const prev = tables.tickets.get(params[0]);
+        tables.tickets.set(params[0], {
+          ticketId: params[0],
+          position: prev ? prev.position : Number(params[1] || 0),
+          data: JSON.parse(params[1]),
+        });
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('INSERT INTO ng_sessions')) {
+        tables.sessions.set(params[0], {
+          id: params[0],
+          createdAt: params[1],
+          data: JSON.parse(params[2]),
+        });
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.includes('ON CONFLICT (session_id, ticket_id) DO NOTHING RETURNING session_id')) {
+        const key = `${params[0]}:${params[1]}`;
+        if (tables.submissions.has(key)) {
+          return { rows: [], rowCount: 0 };
+        }
+        tables.submissions.set(key, {
+          sessionId: params[0],
+          ticketId: params[1],
+          submittedAt: params[2],
+          data: JSON.parse(params[3]),
+        });
+        return { rows: [{ session_id: params[0] }], rowCount: 1 };
+      }
+      if (normalized.startsWith('UPDATE ng_tickets SET data = jsonb_set')) {
+        const existing = tables.tickets.get(params[0]);
+        if (existing) {
+          const used = new Set(existing.data.usedNumbers || []);
+          used.add(Number(params[1]));
+          existing.data = { ...existing.data, usedNumbers: [...used] };
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('DELETE FROM ng_submissions WHERE UPPER(ticket_id)')) {
+        for (const [k, v] of tables.submissions.entries()) {
+          if (v.ticketId.toUpperCase() === String(params[0]).toUpperCase()) tables.submissions.delete(k);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('DELETE FROM ng_tickets WHERE UPPER(ticket_id)')) {
+        for (const k of tables.tickets.keys()) {
+          if (k.toUpperCase() === String(params[0]).toUpperCase()) tables.tickets.delete(k);
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('DELETE FROM ng_submissions')) {
+        tables.submissions.clear();
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('DELETE FROM ng_sessions')) {
+        tables.sessions.clear();
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith('DELETE FROM ng_tickets')) {
+        tables.tickets.clear();
+        return { rows: [], rowCount: 1 };
+      }
+      if (normalized.startsWith("DELETE FROM ng_meta WHERE key = 'seq'")) {
+        tables.meta.delete('seq');
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`Unhandled mock SQL query: ${normalized}`);
+    };
+
+    return {
+      query,
+      async connect() {
+        return { query, release() {} };
+      },
+    };
+  }
+
+  const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-pg-1-'));
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ong-pg-2-'));
+  try {
+    const pgPool = createFakePgPool();
+    const pgPass = 'pg-admin-secret';
+    const remotePg = { url: 'postgres://fake:fake@localhost:5432/postgres' };
+    const rawApp1 = createApp({
+      store: new GameStore(path.join(dir1, 'db.json'), { remoteKv: null, remotePg, pgPool }),
+      adminPassword: pgPass,
+    });
+    const app1 = (req, res) => {
+      req.headers = { 'x-admin-password': pgPass, ...(req.headers || {}) };
+      return rawApp1(req, res);
+    };
+    const app2 = createApp({
+      store: new GameStore(path.join(dir2, 'db.json'), { remoteKv: null, remotePg, pgPool }),
+      adminPassword: pgPass,
+    });
+
+    const tickets = await invokeApp(app1, 'POST', '/api/tickets/generate', {
+      count: 2,
+      playerNames: ['Alice', 'Bob'],
+    });
+    assert.equal(tickets.status, 201);
+
+    const created = await invokeApp(app1, 'POST', '/api/sessions', { name: 'PG Round 1' });
+    assert.equal(created.status, 201);
+    const token = created.json.session.token;
+
+    // App2 sees ticket + session across instances
+    const playInfo = await invokeApp(app2, 'GET', `/api/play/${token}`);
+    assert.equal(playInfo.status, 200);
+    assert.equal(playInfo.json.valid, true);
+
+    // Simultaneous double-submit for same ticket hits 201 + 409 across different instances
+    const t1 = tickets.json.tickets[0];
+    const [race1, race2] = await Promise.all([
+      invokeApp(app1, 'POST', `/api/play/${token}/submit`, {
+        ticketId: t1.ticketId,
+        secretCode: t1.secretCode,
+        selectedNumber: t1.numbers[0],
+      }),
+      invokeApp(app2, 'POST', `/api/play/${token}/submit`, {
+        ticketId: t1.ticketId,
+        secretCode: t1.secretCode,
+        selectedNumber: t1.numbers[0],
+      }),
+    ]);
+    const codes = [race1.status, race2.status].sort((a, b) => a - b);
+    assert.deepEqual(codes, [201, 409]);
+
+    const stateOnApp2 = await invokeApp(rawApp1, 'GET', '/api/state', null, {
+      'x-admin-password': pgPass,
+    });
+    assert.equal(stateOnApp2.json.storage.mode, 'postgres');
+    assert.equal(stateOnApp2.json.storage.persistent, true);
+    assert.equal(stateOnApp2.json.submissions.length, 1);
+    assert.ok(stateOnApp2.json.tickets[0].usedNumbers.includes(t1.numbers[0]));
+  } finally {
     fs.rmSync(dir1, { recursive: true, force: true });
     fs.rmSync(dir2, { recursive: true, force: true });
   }

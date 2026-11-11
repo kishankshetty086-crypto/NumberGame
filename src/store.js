@@ -66,12 +66,68 @@ function getRemoteKvConfig(env = process.env) {
     if (env[name] && env[tokenKey]) {
       return {
         url: String(env[name]).replace(/\/+$/, ''),
-        token: String(env[tokenKey]),
+        token: String(tokenKey ? env[tokenKey] : ''),
         key: prefix,
       };
     }
   }
   return null;
+}
+
+function getRemotePgConfig(env = process.env) {
+  const directKeys = [
+    'POSTGRES_URL',
+    'POSTGRES_URL_NON_POOLING',
+    'POSTGRES_PRISMA_URL',
+    'DATABASE_URL',
+  ];
+  for (const key of directKeys) {
+    if (env[key] && String(env[key]).trim()) {
+      return { url: String(env[key]).trim() };
+    }
+  }
+  for (const name of Object.keys(env)) {
+    if (/^[A-Z0-9_]+_(POSTGRES_URL|DATABASE_URL)$/.test(name) && env[name]) {
+      return { url: String(env[name]).trim() };
+    }
+  }
+  return null;
+}
+
+function buildPgPoolOptions(rawUrl) {
+  let cleanUrl = String(rawUrl || '').trim();
+  let ssl = { rejectUnauthorized: false };
+  try {
+    const parsed = new URL(cleanUrl);
+    const host = String(parsed.hostname || '').toLowerCase();
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    parsed.searchParams.delete('sslmode');
+    parsed.searchParams.delete('pgbouncer');
+    cleanUrl = parsed.toString();
+    ssl = isLocal ? false : { rejectUnauthorized: false };
+  } catch {
+    // keep raw connection string
+  }
+  return {
+    connectionString: cleanUrl,
+    ssl,
+    max: 3,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 10000,
+  };
+}
+
+function parseJsonValue(val, fallback = null) {
+  if (val === null || val === undefined) return fallback;
+  if (typeof val === 'object') return val;
+  if (typeof val === 'string') {
+    try {
+      return JSON.parse(val);
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
 }
 
 function parseRedisHashList(raw) {
@@ -115,11 +171,70 @@ class GameStore {
     this.dbPath = targetPath;
     this.dir = targetDir;
     this._remoteKv = options.remoteKv !== undefined ? options.remoteKv : getRemoteKvConfig();
+    this._remotePg = options.remotePg !== undefined ? options.remotePg : getRemotePgConfig();
+    this._pgPool = options.pgPool || null;
+    this._pgInitPromise = null;
     this._pendingKvCommands = [];
+    this._pendingPgOps = [];
     this._exportTimer = null;
     this._exportsDirty = false;
     this.state = this._load();
     this.exportFiles = this._writeExports();
+  }
+
+  _usesPg() {
+    return Boolean(!this._remoteKv && this._remotePg);
+  }
+
+  _getPgPool() {
+    if (!this._pgPool && this._remotePg) {
+      const { Pool } = require('pg');
+      this._pgPool = new Pool(buildPgPoolOptions(this._remotePg.url));
+    }
+    return this._pgPool;
+  }
+
+  async _ensurePgSchema() {
+    if (!this._usesPg()) return;
+    if (!this._pgInitPromise) {
+      this._pgInitPromise = (async () => {
+        const pool = this._getPgPool();
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS ng_meta (
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS ng_tickets (
+            ticket_id TEXT PRIMARY KEY,
+            position BIGINT NOT NULL DEFAULT 0,
+            data JSONB NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS ng_tickets_pos_idx ON ng_tickets (position ASC, ticket_id ASC);
+          CREATE TABLE IF NOT EXISTS ng_sessions (
+            id TEXT PRIMARY KEY,
+            created_at TIMESTAMPTZ NOT NULL,
+            data JSONB NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS ng_submissions (
+            session_id TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            submitted_at TIMESTAMPTZ NOT NULL,
+            data JSONB NOT NULL,
+            PRIMARY KEY (session_id, ticket_id)
+          );
+        `);
+      })().catch((err) => {
+        this._pgInitPromise = null;
+        throw err;
+      });
+    }
+    return this._pgInitPromise;
+  }
+
+  _queuePg(op) {
+    if (this._usesPg()) {
+      this._pendingPgOps.push(op);
+    }
   }
 
   _kvKeys() {
@@ -143,6 +258,9 @@ class GameStore {
   getStorageInfo() {
     if (this._remoteKv) {
       return { mode: 'redis', persistent: true };
+    }
+    if (this._usesPg()) {
+      return { mode: 'postgres', persistent: true };
     }
     if (this.memoryOnly) {
       return { mode: 'memory', persistent: false };
@@ -170,6 +288,38 @@ class GameStore {
   }
 
   async syncFromRemote() {
+    if (this._usesPg()) {
+      await this._ensurePgSchema();
+      const pool = this._getPgPool();
+      const [metaRes, ticketRes, sessionRes, subRes] = await Promise.all([
+        pool.query(`SELECT key, value FROM ng_meta WHERE key IN ('seq', 'auth')`),
+        pool.query(`SELECT data FROM ng_tickets ORDER BY position ASC, ticket_id ASC`),
+        pool.query(`SELECT data FROM ng_sessions ORDER BY created_at DESC`),
+        pool.query(`SELECT data FROM ng_submissions ORDER BY submitted_at ASC`),
+      ]);
+      let seqVal = 1;
+      let auth = null;
+      for (const row of metaRes.rows || []) {
+        if (row.key === 'seq') {
+          const parsedSeq = parseJsonValue(row.value, 1);
+          seqVal = Math.max(1, Number(parsedSeq || 1));
+        } else if (row.key === 'auth') {
+          auth = parseJsonValue(row.value, null);
+        }
+      }
+      this.state = {
+        nextTicketSeq: seqVal,
+        tickets: (ticketRes.rows || []).map((r) => parseJsonValue(r.data)).filter(Boolean),
+        sessions: (sessionRes.rows || []).map((r) => parseJsonValue(r.data)).filter(Boolean),
+        submissions: (subRes.rows || []).map((r) => parseJsonValue(r.data)).filter(Boolean),
+        auth,
+      };
+      this._pendingPgOps = [];
+      this._persist(this.state);
+      this.exportFiles = this._writeExports();
+      return;
+    }
+
     if (!this._remoteKv) return;
     const keys = this._kvKeys();
     const results = await this._runKvPipeline([
@@ -236,11 +386,39 @@ class GameStore {
     this.state.auth = authObj;
     const keys = this._kvKeys();
     this._queueKv(['SET', keys.auth, JSON.stringify(authObj)]);
+    this._queuePg((client) =>
+      client.query(
+        `INSERT INTO ng_meta (key, value) VALUES ('auth', $1::jsonb)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(authObj)]
+      )
+    );
     this.save();
     return this.state.auth;
   }
 
   async flushRemote() {
+    if (this._usesPg()) {
+      if (this._pendingPgOps.length === 0) return;
+      await this._ensurePgSchema();
+      const ops = this._pendingPgOps;
+      this._pendingPgOps = [];
+      const client = await this._getPgPool().connect();
+      try {
+        await client.query('BEGIN');
+        for (const op of ops) {
+          await op(client);
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+      return;
+    }
+
     if (!this._remoteKv || this._pendingKvCommands.length === 0) return;
     const commands = this._pendingKvCommands;
     this._pendingKvCommands = [];
@@ -248,7 +426,7 @@ class GameStore {
   }
 
   _writeExports() {
-    if (this.memoryOnly || isServerlessEnv() || this._remoteKv) return null;
+    if (this.memoryOnly || isServerlessEnv() || this._remoteKv || this._usesPg()) return null;
     this._exportsDirty = false;
     try {
       const lb = computeCombinedLeaderboard(
@@ -263,7 +441,7 @@ class GameStore {
   }
 
   _scheduleExports() {
-    if (this.memoryOnly || isServerlessEnv() || this._remoteKv) return;
+    if (this.memoryOnly || isServerlessEnv() || this._remoteKv || this._usesPg()) return;
     this._exportsDirty = true;
     if (this._exportTimer) clearTimeout(this._exportTimer);
     this._exportTimer = setTimeout(() => {
@@ -345,6 +523,7 @@ class GameStore {
   }
 
   addTickets(newTickets) {
+    const startPos = this.state.nextTicketSeq;
     this.state.tickets.push(...newTickets);
     this.state.nextTicketSeq += newTickets.length;
     if (newTickets.length > 0) {
@@ -355,6 +534,24 @@ class GameStore {
       }
       this._queueKv(['HSET', ...args]);
       this._queueKv(['SET', keys.seq, String(this.state.nextTicketSeq)]);
+
+      const nextSeq = this.state.nextTicketSeq;
+      const ticketIds = newTickets.map((t) => t.ticketId);
+      const positions = newTickets.map((_, idx) => startPos + idx);
+      const payloads = newTickets.map((t) => JSON.stringify(t));
+      this._queuePg(async (client) => {
+        await client.query(
+          `INSERT INTO ng_tickets (ticket_id, position, data)
+           SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::jsonb[])
+           ON CONFLICT (ticket_id) DO UPDATE SET data = EXCLUDED.data`,
+          [ticketIds, positions, payloads]
+        );
+        await client.query(
+          `INSERT INTO ng_meta (key, value) VALUES ('seq', $1::jsonb)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [JSON.stringify(nextSeq)]
+        );
+      });
     }
     this.save();
     return newTickets;
@@ -365,6 +562,15 @@ class GameStore {
     if (!ticket) return null;
     Object.assign(ticket, patch);
     this._queueKv(['HSET', this._kvKeys().tickets, ticket.ticketId, JSON.stringify(ticket)]);
+    const snap = JSON.stringify(ticket);
+    const tid = ticket.ticketId;
+    this._queuePg((client) =>
+      client.query(
+        `INSERT INTO ng_tickets (ticket_id, position, data) VALUES ($1, 0, $2::jsonb)
+         ON CONFLICT (ticket_id) DO UPDATE SET data = EXCLUDED.data`,
+        [tid, snap]
+      )
+    );
     this.save();
     return ticket;
   }
@@ -393,6 +599,7 @@ class GameStore {
       ]);
     }
 
+    const updatedSessions = [];
     for (const ses of this.state.sessions) {
       if (ses.roundResult && Array.isArray(ses.roundResult.winnerTicketIds)) {
         const filteredIds = ses.roundResult.winnerTicketIds.filter(
@@ -404,9 +611,26 @@ class GameStore {
             winnerTicketIds: filteredIds,
           };
           this._queueKv(['HSET', keys.sessions, ses.id, JSON.stringify(ses)]);
+          updatedSessions.push({
+            id: ses.id,
+            createdAt: ses.createdAt || new Date().toISOString(),
+            data: JSON.stringify(ses),
+          });
         }
       }
     }
+
+    this._queuePg(async (client) => {
+      await client.query(`DELETE FROM ng_tickets WHERE UPPER(ticket_id) = UPPER($1)`, [canonicalId]);
+      await client.query(`DELETE FROM ng_submissions WHERE UPPER(ticket_id) = UPPER($1)`, [canonicalId]);
+      for (const s of updatedSessions) {
+        await client.query(
+          `INSERT INTO ng_sessions (id, created_at, data) VALUES ($1, $2::timestamptz, $3::jsonb)
+           ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+          [s.id, s.createdAt, s.data]
+        );
+      }
+    });
 
     this.save();
     return true;
@@ -427,6 +651,16 @@ class GameStore {
   addSession(session) {
     this.state.sessions.unshift(session);
     this._queueKv(['HSET', this._kvKeys().sessions, session.id, JSON.stringify(session)]);
+    const sid = session.id;
+    const createdAt = session.createdAt || new Date().toISOString();
+    const payload = JSON.stringify(session);
+    this._queuePg((client) =>
+      client.query(
+        `INSERT INTO ng_sessions (id, created_at, data) VALUES ($1, $2::timestamptz, $3::jsonb)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
+        [sid, createdAt, payload]
+      )
+    );
     this.save();
     return session;
   }
@@ -436,6 +670,16 @@ class GameStore {
     if (!session) return null;
     Object.assign(session, patch);
     this._queueKv(['HSET', this._kvKeys().sessions, session.id, JSON.stringify(session)]);
+    const sid = session.id;
+    const createdAt = session.createdAt || new Date().toISOString();
+    const payload = JSON.stringify(session);
+    this._queuePg((client) =>
+      client.query(
+        `INSERT INTO ng_sessions (id, created_at, data) VALUES ($1, $2::timestamptz, $3::jsonb)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+        [sid, createdAt, payload]
+      )
+    );
     this.save();
     return session;
   }
@@ -448,6 +692,7 @@ class GameStore {
       this.state.submissions = this.state.submissions.filter((sub) => sub.sessionId !== id);
       const keys = this._kvKeys();
       this._queueKv(['HDEL', keys.sessions, id]);
+      const affectedSnapshots = [];
       if (removedSubs.length > 0) {
         this._queueKv([
           'HDEL',
@@ -468,12 +713,24 @@ class GameStore {
           const tid = t.ticketId.toUpperCase();
           if (!affectedIds.has(tid)) continue;
           t.usedNumbers = [...new Set(remainingByTicket.get(tid) || [])];
-          updatedArgs.push(t.ticketId, JSON.stringify(t));
+          const snap = JSON.stringify(t);
+          updatedArgs.push(t.ticketId, snap);
+          affectedSnapshots.push({ ticketId: t.ticketId, data: snap });
         }
         if (updatedArgs.length > 0) {
           this._queueKv(['HSET', keys.tickets, ...updatedArgs]);
         }
       }
+      this._queuePg(async (client) => {
+        await client.query(`DELETE FROM ng_sessions WHERE id = $1`, [id]);
+        await client.query(`DELETE FROM ng_submissions WHERE session_id = $1`, [id]);
+        for (const item of affectedSnapshots) {
+          await client.query(
+            `UPDATE ng_tickets SET data = $2::jsonb WHERE ticket_id = $1`,
+            [item.ticketId, item.data]
+          );
+        }
+      });
       this.save();
       return true;
     }
@@ -495,12 +752,24 @@ class GameStore {
 
   addSubmission(submission) {
     this.state.submissions.push(submission);
+    const snap = JSON.stringify(submission);
     this._queueKv([
       'HSET',
       this._kvKeys().submissions,
       `${submission.sessionId}:${submission.ticketId}`,
-      JSON.stringify(submission),
+      snap,
     ]);
+    const sid = submission.sessionId;
+    const tid = submission.ticketId;
+    const submittedAt = submission.submittedAt || new Date().toISOString();
+    this._queuePg((client) =>
+      client.query(
+        `INSERT INTO ng_submissions (session_id, ticket_id, submitted_at, data)
+         VALUES ($1, $2, $3::timestamptz, $4::jsonb)
+         ON CONFLICT (session_id, ticket_id) DO UPDATE SET data = EXCLUDED.data`,
+        [sid, tid, submittedAt, snap]
+      )
+    );
     this.save();
     return submission;
   }
@@ -508,19 +777,39 @@ class GameStore {
   recordSubmission(submission, nextUsedNumbers = null) {
     this.state.submissions.push(submission);
     const keys = this._kvKeys();
+    const subSnap = JSON.stringify(submission);
     this._queueKv([
       'HSET',
       keys.submissions,
       `${submission.sessionId}:${submission.ticketId}`,
-      JSON.stringify(submission),
+      subSnap,
     ]);
+    let ticketSnap = null;
     if (Array.isArray(nextUsedNumbers)) {
       const ticket = this.findTicketById(submission.ticketId);
       if (ticket) {
         ticket.usedNumbers = nextUsedNumbers;
-        this._queueKv(['HSET', keys.tickets, ticket.ticketId, JSON.stringify(ticket)]);
+        ticketSnap = JSON.stringify(ticket);
+        this._queueKv(['HSET', keys.tickets, ticket.ticketId, ticketSnap]);
       }
     }
+    const sid = submission.sessionId;
+    const tid = submission.ticketId;
+    const submittedAt = submission.submittedAt || new Date().toISOString();
+    this._queuePg(async (client) => {
+      await client.query(
+        `INSERT INTO ng_submissions (session_id, ticket_id, submitted_at, data)
+         VALUES ($1, $2, $3::timestamptz, $4::jsonb)
+         ON CONFLICT (session_id, ticket_id) DO UPDATE SET data = EXCLUDED.data`,
+        [sid, tid, submittedAt, subSnap]
+      );
+      if (ticketSnap) {
+        await client.query(`UPDATE ng_tickets SET data = $2::jsonb WHERE ticket_id = $1`, [
+          tid,
+          ticketSnap,
+        ]);
+      }
+    });
     this.save();
     return submission;
   }
@@ -555,6 +844,65 @@ class GameStore {
     this.state.submissions.push(submission);
     const keys = this._kvKeys();
     const field = `${submission.sessionId}:${submission.ticketId}`;
+
+    if (this._usesPg()) {
+      await this._ensurePgSchema();
+      const pool = this._getPgPool();
+      let insRes;
+      try {
+        insRes = await pool.query(
+          `INSERT INTO ng_submissions (session_id, ticket_id, submitted_at, data)
+           VALUES ($1, $2, $3::timestamptz, $4::jsonb)
+           ON CONFLICT (session_id, ticket_id) DO NOTHING
+           RETURNING session_id`,
+          [
+            submission.sessionId,
+            submission.ticketId,
+            submission.submittedAt || new Date().toISOString(),
+            JSON.stringify(submission),
+          ]
+        );
+      } catch (err) {
+        this.state.submissions = this.state.submissions.filter((s) => s.id !== submission.id);
+        throw err;
+      }
+
+      if (!insRes || insRes.rowCount === 0) {
+        this.state.submissions = this.state.submissions.filter((s) => s.id !== submission.id);
+        await this.syncFromRemote();
+        return {
+          duplicate: true,
+          existing: this.findSubmission(submission.sessionId, submission.ticketId),
+        };
+      }
+
+      const ticket = this.findTicketById(submission.ticketId);
+      const consumedNum =
+        selectedNumber !== null && selectedNumber !== undefined ? Number(selectedNumber) : NaN;
+      if (ticket && Number.isInteger(consumedNum)) {
+        ticket.usedNumbers = [...new Set([...(ticket.usedNumbers || []), consumedNum])];
+        await pool.query(
+          `UPDATE ng_tickets
+           SET data = jsonb_set(
+             data,
+             '{usedNumbers}',
+             COALESCE(
+               (
+                 SELECT jsonb_agg(DISTINCT to_jsonb(elem::int))
+                 FROM jsonb_array_elements_text(
+                   COALESCE(data->'usedNumbers', '[]'::jsonb) || jsonb_build_array($2::int)
+                 ) AS elem
+               ),
+               '[]'::jsonb
+             )
+           )
+           WHERE ticket_id = $1`,
+          [ticket.ticketId, consumedNum]
+        );
+      }
+      this._persist(this.state);
+      return { duplicate: false, submission };
+    }
 
     if (this._remoteKv) {
       let pipelineRes;
@@ -626,6 +974,16 @@ class GameStore {
         ['DEL', keys.seq, keys.tickets, keys.sessions, keys.submissions, keys.legacy],
       ];
     }
+    if (this._usesPg()) {
+      this._pendingPgOps = [
+        async (client) => {
+          await client.query(`DELETE FROM ng_submissions`);
+          await client.query(`DELETE FROM ng_sessions`);
+          await client.query(`DELETE FROM ng_tickets`);
+          await client.query(`DELETE FROM ng_meta WHERE key = 'seq'`);
+        },
+      ];
+    }
     this.save({ immediateExports: true });
     return this.state;
   }
@@ -634,4 +992,5 @@ class GameStore {
 module.exports = {
   GameStore,
   getRemoteKvConfig,
+  getRemotePgConfig,
 };
