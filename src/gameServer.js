@@ -10,6 +10,7 @@ const {
   generateSecretCode,
   generateTicketId,
   generateSessionToken,
+  roundPoints,
   evaluateWinners,
 } = require('./gameLogic');
 const { renderTicketHtml, renderAllTicketsHtml, buildZip } = require('./ticketHtml');
@@ -847,9 +848,9 @@ function createApp({ store, adminPassword } = {}) {
 
         const body = await readJsonBody(req);
         const rawPoints = body.pointsPerWin === undefined ? 1 : Number(body.pointsPerWin);
-        if (!Number.isFinite(rawPoints) || !Number.isInteger(rawPoints) || rawPoints < 1 || rawPoints > 1000) {
+        if (!Number.isFinite(rawPoints) || !Number.isInteger(rawPoints) || rawPoints < 1 || rawPoints > 100000) {
           return sendJson(res, 400, {
-            error: 'Points per win must be a whole number between 1 and 1000.',
+            error: 'Round winning points must be a whole number between 1 and 100000.',
           });
         }
         const pointsPerWin = rawPoints;
@@ -874,6 +875,9 @@ function createApp({ store, adminPassword } = {}) {
           return sendJson(res, 400, { error: evalErr.message });
         }
 
+        const pointsPerWinner =
+          result.winners.length > 0 ? roundPoints(pointsPerWin / result.winners.length) : 0;
+
         let roundResult = session.roundResult || null;
 
         if (saveToLeaderboard) {
@@ -882,6 +886,7 @@ function createApp({ store, adminPassword } = {}) {
             winningValue: result.winningValue,
             range: result.range,
             pointsPerWin,
+            pointsPerWinner,
             winnerTicketIds: result.winners.map((w) => w.ticketId),
             evaluatedAt: new Date().toISOString(),
           };
@@ -892,6 +897,8 @@ function createApp({ store, adminPassword } = {}) {
           sessionId: session.id,
           sessionName: session.name,
           savedToLeaderboard: saveToLeaderboard,
+          pointsPerWin,
+          pointsPerWinner,
           roundResult,
           ...result,
         });

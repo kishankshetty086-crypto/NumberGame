@@ -11,9 +11,15 @@ const {
   validateTicketSetDistribution,
   evaluateWinners,
   getDecadeSetIndex,
+  computeCombinedLeaderboard,
 } = require('../src/gameLogic');
 const { renderTicketHtml, buildZip } = require('../src/ticketHtml');
-const { toCsv, toXlsxBuffer } = require('../src/exportData');
+const {
+  toCsv,
+  toXlsxBuffer,
+  buildLeaderboardCsv,
+  buildLeaderboardXlsx,
+} = require('../src/exportData');
 const { GameStore, getRemoteKvConfig, getRemotePgConfig } = require('../src/store');
 const { createApp } = require('../src/gameServer');
 
@@ -841,4 +847,132 @@ test('Multi-instance Postgres mode preserves shared state and enforces atomic do
     fs.rmSync(dir1, { recursive: true, force: true });
     fs.rmSync(dir2, { recursive: true, force: true });
   }
+});
+
+test('Final leaderboard splits tied round prize points equally (including decimals) and aligns grandWinners with Rank #1', () => {
+  const tickets = [
+    { ticketId: 'T-01', playerName: 'Alice', numbers: [10, 20], usedNumbers: [] },
+    { ticketId: 'T-02', playerName: 'Bob', numbers: [10, 20], usedNumbers: [] },
+    { ticketId: 'T-03', playerName: 'Charlie', numbers: [10, 20], usedNumbers: [] },
+    { ticketId: 'T-04', playerName: 'Dave', numbers: [10, 20], usedNumbers: [] },
+    { ticketId: 'T-05', playerName: 'Eve', numbers: [10, 20], usedNumbers: [] },
+  ];
+
+  // Round 1: 100 pts shared across 3 winners -> 33.33 each
+  // Round 2: 100 pts shared across 4 winners -> 25 each
+  // Round 3: 100 pts shared across 5 winners -> 20 each
+  // Suppose Alice wins Round 1 (33.33) + Round 2 (25) = 58.33 (2 wins)
+  // And in Round 4 (sole win 58.33 -> 1 win): even if tied at exact 58.33 pts, Alice has 2 wins (Rank #1) while sole-round winner has 1 win (Rank #2)
+  const sessions = [
+    {
+      id: 'S1',
+      name: 'R1 (3-way tie)',
+      status: 'EXPIRED',
+      createdAt: '2026-01-01T00:00:00Z',
+      roundResult: {
+        mode: 'least',
+        pointsPerWin: 100,
+        winnerTicketIds: ['T-01', 'T-02', 'T-03'],
+      },
+    },
+    {
+      id: 'S2',
+      name: 'R2 (4-way tie)',
+      status: 'EXPIRED',
+      createdAt: '2026-01-02T00:00:00Z',
+      roundResult: {
+        mode: 'highest',
+        pointsPerWin: 100,
+        winnerTicketIds: ['T-01', 'T-02', 'T-03', 'T-04'],
+      },
+    },
+    {
+      id: 'S3',
+      name: 'R3 (5-way tie)',
+      status: 'EXPIRED',
+      createdAt: '2026-01-03T00:00:00Z',
+      roundResult: {
+        mode: 'range',
+        pointsPerWin: 100,
+        winnerTicketIds: ['T-01', 'T-02', 'T-03', 'T-04', 'T-05'],
+      },
+    },
+  ];
+  const submissions = [
+    { sessionId: 'S1', ticketId: 'T-01', selectedNumber: 10 },
+    { sessionId: 'S1', ticketId: 'T-02', selectedNumber: 10 },
+    { sessionId: 'S1', ticketId: 'T-03', selectedNumber: 10 },
+    { sessionId: 'S2', ticketId: 'T-01', selectedNumber: 20 },
+    { sessionId: 'S2', ticketId: 'T-02', selectedNumber: 20 },
+    { sessionId: 'S2', ticketId: 'T-03', selectedNumber: 20 },
+    { sessionId: 'S2', ticketId: 'T-04', selectedNumber: 20 },
+    { sessionId: 'S3', ticketId: 'T-01', selectedNumber: 10 },
+    { sessionId: 'S3', ticketId: 'T-02', selectedNumber: 10 },
+    { sessionId: 'S3', ticketId: 'T-03', selectedNumber: 10 },
+    { sessionId: 'S3', ticketId: 'T-04', selectedNumber: 10 },
+    { sessionId: 'S3', ticketId: 'T-05', selectedNumber: 10 },
+  ];
+
+  const lb = computeCombinedLeaderboard(tickets, sessions, submissions);
+  assert.equal(lb.rounds[0].pointsPerWinner, 33.33);
+  assert.equal(lb.rounds[1].pointsPerWinner, 25);
+  assert.equal(lb.rounds[2].pointsPerWinner, 20);
+
+  // Alice, Bob, Charlie each earned 33.33 + 25 + 20 = 78.33 across 3 wins -> all tied Rank #1
+  assert.equal(lb.leaderboard[0].totalPoints, 78.33);
+  assert.equal(lb.leaderboard[1].totalPoints, 78.33);
+  assert.equal(lb.leaderboard[2].totalPoints, 78.33);
+  assert.equal(lb.leaderboard[3].totalPoints, 45); // Dave: 25 + 20
+  assert.equal(lb.leaderboard[4].totalPoints, 20); // Eve: 20
+  assert.equal(lb.grandWinners.length, 3);
+  assert.ok(lb.grandWinners.every((gw) => gw.rank === 1));
+
+  // CSV & XLSX exports preserve decimal points
+  const csv = buildLeaderboardCsv(lb);
+  assert.ok(csv.includes('78.33'));
+  assert.ok(csv.includes('+33.33'));
+  const xlsx = buildLeaderboardXlsx(lb);
+  assert.ok(Buffer.isBuffer(xlsx) && xlsx.length > 0);
+
+  // Tie on totalPoints with DIFFERENT round wins -> only Rank #1 appears in grandWinners
+  const tieByWinsLb = computeCombinedLeaderboard(
+    [
+      { ticketId: 'A', playerName: 'Alice', numbers: [10], usedNumbers: [] },
+      { ticketId: 'B', playerName: 'Bob', numbers: [20], usedNumbers: [] },
+    ],
+    [
+      {
+        id: 'R1',
+        name: 'R1',
+        status: 'EXPIRED',
+        createdAt: '2026-01-01T00:00:00Z',
+        roundResult: { mode: 'least', pointsPerWin: 50, winnerTicketIds: ['A'] },
+      },
+      {
+        id: 'R2',
+        name: 'R2',
+        status: 'EXPIRED',
+        createdAt: '2026-01-02T00:00:00Z',
+        roundResult: { mode: 'least', pointsPerWin: 50, winnerTicketIds: ['A'] },
+      },
+      {
+        id: 'R3',
+        name: 'R3',
+        status: 'EXPIRED',
+        createdAt: '2026-01-03T00:00:00Z',
+        roundResult: { mode: 'highest', pointsPerWin: 100, winnerTicketIds: ['B'] },
+      },
+    ],
+    []
+  );
+  assert.equal(tieByWinsLb.leaderboard[0].playerName, 'Alice');
+  assert.equal(tieByWinsLb.leaderboard[0].totalPoints, 100);
+  assert.equal(tieByWinsLb.leaderboard[0].totalWins, 2);
+  assert.equal(tieByWinsLb.leaderboard[0].rank, 1);
+  assert.equal(tieByWinsLb.leaderboard[1].playerName, 'Bob');
+  assert.equal(tieByWinsLb.leaderboard[1].totalPoints, 100);
+  assert.equal(tieByWinsLb.leaderboard[1].totalWins, 1);
+  assert.equal(tieByWinsLb.leaderboard[1].rank, 2);
+  assert.equal(tieByWinsLb.grandWinners.length, 1);
+  assert.equal(tieByWinsLb.grandWinners[0].playerName, 'Alice');
 });

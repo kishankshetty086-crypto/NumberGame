@@ -190,8 +190,9 @@
           </div>
 
           <div class="field">
-            <label for="eval-points">Points per Round Winner</label>
-            <input type="number" id="eval-points" min="1" max="100" value="1" />
+            <label for="eval-points">Round Winning Points (Shared if Tied)</label>
+            <input type="number" id="eval-points" min="1" max="100000" value="1" />
+            <small>If multiple players tie in this round, these points are divided equally among them (including decimals).</small>
           </div>
 
           <div class="field">
@@ -243,7 +244,7 @@
           <div>
             <h2 style="margin:0">Combined Multi-Round Final Leaderboard</h2>
             <p style="margin:4px 0 0; color:var(--muted); font-size:13px;">
-              Aggregates wins and points across all evaluated round sessions.
+              Aggregates shared round prize points across all evaluated sessions. Ties in a round split that round's points equally.
             </p>
           </div>
           <div class="btn-row">

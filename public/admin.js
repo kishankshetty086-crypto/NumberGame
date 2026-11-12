@@ -709,6 +709,12 @@ async function runWinnerEvaluation(mode, extra = {}) {
   }
 }
 
+function formatPoints(val) {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n)) return '0';
+  return n.toFixed(4).replace(/\.?0+$/, '');
+}
+
 function renderWinnerResults(res) {
   const el = document.getElementById('winner-results');
   let ruleText = '';
@@ -730,6 +736,12 @@ function renderWinnerResults(res) {
     return;
   }
 
+  const prizePool = Number(res.pointsPerWin || res.roundResult?.pointsPerWin || 1);
+  const perWinner =
+    res.pointsPerWinner !== undefined
+      ? Number(res.pointsPerWinner)
+      : Math.round(((prizePool / res.winners.length) + Number.EPSILON) * 10000) / 10000;
+
   const cards = res.winners
     .map(
       (w) => `
@@ -737,6 +749,7 @@ function renderWinnerResults(res) {
         <div class="winner-number">${w.selectedNumber}</div>
         <div style="font-weight:700; font-size:16px; margin-top:4px;">${esc(w.playerName)}</div>
         <div class="mono" style="font-size:12px; color:var(--muted);">${esc(w.ticketId)}</div>
+        <div class="mono" style="font-size:12px; color:#34d399; margin-top:4px;">+${formatPoints(perWinner)} pts${res.winners.length > 1 ? ` (${formatPoints(prizePool)} ÷ ${res.winners.length})` : ''}</div>
       </div>
     `
     )
@@ -746,6 +759,7 @@ function renderWinnerResults(res) {
     <div class="winner-banner">
       <div style="font-size:12px; font-weight:700; text-transform:uppercase; color:#6ee7b7;">
         ${esc(res.sessionName)} • ${ruleText} • ${res.winners.length} Winner(s) out of ${res.totalSubmissions}
+        • Pool: ${formatPoints(prizePool)} pts (${formatPoints(perWinner)} pts each)
         ${res.savedToLeaderboard ? ' • Added to Final Leaderboard' : ''}
       </div>
       <div class="winner-cards">${cards}</div>
@@ -774,14 +788,29 @@ function renderLeaderboard(data) {
   const thead = document.getElementById('leaderboard-thead');
   const tbody = document.getElementById('leaderboard-tbody');
 
+  const rulesHtml = `
+    <div style="font-size:12px; color:var(--muted); margin:10px 0 14px;">
+      <strong>Leaderboard Rules:</strong> Each round's winning points are split equally among tied round winners (decimals supported). Ranks follow <strong>Total Points → Round Wins → Rounds Played</strong>.
+    </div>
+  `;
+
   if (data.grandWinners && data.grandWinners.length > 0) {
+    const gwCount = data.grandWinners.length;
+    const topPts = data.grandWinners[0].totalPoints;
+    const nextRow = (data.leaderboard || [])[gwCount];
+    const brokenByWins = gwCount === 1 && nextRow && nextRow.totalPoints === topPts;
+    const headline =
+      gwCount === 1
+        ? `🏆 Overall Final Winner • Across ${data.evaluatedRoundsCount} Evaluated Round(s)${brokenByWins ? ' (Won Tie-Breaker by More Round Wins)' : ''}`
+        : `🤝 Tied Co-Winners (#1 — ${gwCount} Players) • Across ${data.evaluatedRoundsCount} Evaluated Round(s)`;
+
     const cards = data.grandWinners
       .map(
         (gw) => `
         <div class="winner-card">
-          <div class="winner-number">#${gw.rank} • ${gw.totalPoints} pts</div>
+          <div class="winner-number">#${gw.rank} • ${formatPoints(gw.totalPoints)} pts</div>
           <div style="font-weight:700; font-size:17px; margin-top:4px;">${esc(gw.playerName)}</div>
-          <div class="mono" style="font-size:12px; color:var(--muted);">${esc(gw.ticketId)} • ${gw.totalWins} round win(s)</div>
+          <div class="mono" style="font-size:12px; color:var(--muted);">${esc(gw.ticketId)} • ${gw.totalWins} win(s) • ${gw.roundsPlayed} played</div>
         </div>
       `
       )
@@ -789,16 +818,18 @@ function renderLeaderboard(data) {
     grandBox.innerHTML = `
       <div class="winner-banner">
         <div style="font-size:12px; font-weight:700; text-transform:uppercase; color:#6ee7b7;">
-          Overall Leaderboard Winner(s) • Across ${data.evaluatedRoundsCount} Evaluated Round(s)
+          ${headline}
         </div>
         <div class="winner-cards">${cards}</div>
       </div>
+      ${rulesHtml}
     `;
   } else {
     grandBox.innerHTML = `
       <div class="alert alert-info">
         Evaluate at least one closed round in Tab 3 (<strong>Round Winner Evaluation</strong>) to crown the combined Final Leaderboard winner(s).
       </div>
+      ${rulesHtml}
     `;
   }
 
@@ -807,7 +838,14 @@ function renderLeaderboard(data) {
       const rule = r.roundResult
         ? `${r.roundResult.mode.toUpperCase()}${r.roundResult.range ? ` (${r.roundResult.range.min}-${r.roundResult.range.max})` : ''}`
         : 'Not Evaluated';
-      return `<span class="pill ${r.evaluated ? 'ok' : 'warn'}">${esc(r.sessionName)}: ${esc(rule)}</span>`;
+      const splitInfo = r.evaluated
+        ? r.winnerCount > 1
+          ? ` • ${formatPoints(r.prizePool)} pts ÷ ${r.winnerCount} = ${formatPoints(r.pointsPerWinner)} each`
+          : r.winnerCount === 1
+            ? ` • ${formatPoints(r.prizePool)} pts`
+            : ` • 0 winners`
+        : '';
+      return `<span class="pill ${r.evaluated ? 'ok' : 'warn'}">${esc(r.sessionName)}: ${esc(rule)}${esc(splitInfo)}</span>`;
     })
     .join('');
 
@@ -838,7 +876,7 @@ function renderLeaderboard(data) {
             return '<td style="color:var(--muted)">—</td>';
           }
           if (rb.won) {
-            return `<td><span class="pill ok">${rb.selectedNumber} WIN (+${rb.points})</span></td>`;
+            return `<td><span class="pill ok">${rb.selectedNumber} WIN (+${formatPoints(rb.points)})</span></td>`;
           }
           return `<td><span class="pill">${rb.selectedNumber}</span></td>`;
         })
@@ -849,7 +887,7 @@ function renderLeaderboard(data) {
           <td><strong>#${row.rank}</strong></td>
           <td><strong>${esc(row.playerName)}</strong></td>
           <td class="mono">${esc(row.ticketId)}</td>
-          <td><strong style="font-size:16px; color:#34d399;">${row.totalPoints}</strong></td>
+          <td><strong style="font-size:16px; color:#34d399;">${formatPoints(row.totalPoints)}</strong></td>
           <td>${row.totalWins}</td>
           <td>${row.roundsPlayed}</td>
           <td>${row.totalNumberSum}</td>

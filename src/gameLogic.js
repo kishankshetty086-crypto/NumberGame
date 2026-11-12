@@ -236,10 +236,22 @@ function evaluateWinners(submissions, mode, { min = null, max = null } = {}) {
   };
 }
 
+function roundPoints(val) {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n) || n === 0) return 0;
+  const r2 = Math.round((n + Number.EPSILON) * 100) / 100;
+  if (r2 !== 0) return r2;
+  return Math.round((n + Number.EPSILON) * 10000) / 10000;
+}
+
+function sumPoints(a, b) {
+  return Math.round((Number(a || 0) + Number(b || 0) + Number.EPSILON) * 10000) / 10000;
+}
+
 /**
  * Computes a combined multi-round leaderboard across all sessions.
  * Sessions are ordered chronologically (oldest round first).
- * Evaluates each player's total wins, total points, rounds played, sum of picks, and per-round breakdown.
+ * Evaluates each player's total wins, shared prize points, rounds played, sum of picks, and per-round breakdown.
  */
 function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = []) {
   const chronologicalSessions = [...sessions].sort(
@@ -272,13 +284,16 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
   const roundsSummary = chronologicalSessions.map((ses) => {
     const subByTicket = subsBySession.get(ses.id) || new Map();
     const rr = ses.roundResult || null;
-    const winnerIds = new Set(rr?.winnerTicketIds || []);
-    const pointsPerWin = Number(rr?.pointsPerWin || 1);
+    const rawWinnerIds = rr?.winnerTicketIds || [];
+    const activeWinnerIds = new Set(rawWinnerIds.filter((id) => playerMap.has(id)));
+    const winnerCount = activeWinnerIds.size;
+    const prizePool = rr ? Number(rr.pointsPerWin || 1) : 0;
+    const pointsPerWinner = rr && winnerCount > 0 ? roundPoints(prizePool / winnerCount) : 0;
 
     for (const [ticketId, entry] of playerMap.entries()) {
       const sub = subByTicket.get(ticketId);
-      const won = Boolean(rr && winnerIds.has(ticketId));
-      const pts = won ? pointsPerWin : 0;
+      const won = Boolean(rr && activeWinnerIds.has(ticketId));
+      const pts = won ? pointsPerWinner : 0;
 
       if (sub) {
         entry.roundsPlayed += 1;
@@ -286,7 +301,7 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
       }
       if (won) {
         entry.totalWins += 1;
-        entry.totalPoints += pts;
+        entry.totalPoints = sumPoints(entry.totalPoints, pts);
       }
 
       entry.roundBreakdown.push({
@@ -295,6 +310,8 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
         selectedNumber: sub ? Number(sub.selectedNumber) : null,
         won,
         points: pts,
+        prizePool,
+        sharedAmong: winnerCount,
         evaluated: Boolean(rr),
       });
     }
@@ -305,6 +322,9 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
       status: ses.status,
       submissionCount: subByTicket.size,
       evaluated: Boolean(rr),
+      winnerCount,
+      prizePool,
+      pointsPerWinner,
       roundResult: rr,
     };
   });
@@ -335,7 +355,7 @@ function computeCombinedLeaderboard(tickets = [], sessions = [], submissions = [
   const topPoints = leaderboard.length > 0 ? leaderboard[0].totalPoints : 0;
   const grandWinners =
     evaluatedRoundsCount > 0 && topPoints > 0
-      ? leaderboard.filter((r) => r.totalPoints === topPoints)
+      ? leaderboard.filter((r) => r.rank === 1)
       : [];
 
   return {
@@ -355,6 +375,7 @@ module.exports = {
   generateSecretCode,
   generateTicketId,
   generateSessionToken,
+  roundPoints,
   evaluateWinners,
   computeCombinedLeaderboard,
 };
